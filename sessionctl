@@ -1,0 +1,18 @@
+#!/usr/bin/python3
+# Deliberately /usr/bin/python3, not `env python3`: bare python3 resolves to
+# whichever conda env happens to be active, and this tool must not depend on that.
+"""sessionctl entry point."""
+
+import os
+import sys
+
+# realpath, not abspath: `~/.local/bin/sessionctl` symlinks to a deployed
+# copy of this file (see setup.py) so it always finds sessionctl_lib/
+# alongside *that* copy, not the symlink's own directory -- abspath does not
+# resolve symlinks, realpath does.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from sessionctl_lib.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

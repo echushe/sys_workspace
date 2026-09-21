@@ -1,0 +1,14 @@
+[Unit]
+Description=sessionctl periodic session snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sessionctl save
+
+# A save normally takes ~0.1s. It does talk to three things that are out of
+# its control, though -- gnome-terminal over D-Bus, X11 via Wnck, and the
+# accessibility bus for the tab-to-window mapping -- and a hung peer there
+# would otherwise leave this unit running until something else killed it,
+# with the timer stacking another every 30 seconds. Bounding it means a stuck
+# save is one failed run in the journal instead of a pile of them.
+TimeoutStartSec=60

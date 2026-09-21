@@ -1,0 +1,39 @@
+[Unit]
+Description=Periodic sessionctl session snapshot
+
+[Timer]
+# OnStartupSec is the load-bearing one for a *user* timer, and its absence is
+# what left this timer stranded for a whole session once. systemd.timer(5):
+# OnBootSec= is relative to machine boot (the remapping to OnStartupSec=
+# applies only to the system manager in a container, not to per-user
+# managers), while OnStartupSec= is relative to the service manager's own
+# start -- "primarily useful when configured in units running in the per-user
+# service manager, as the user service manager is generally started on first
+# login only, not already during boot".
+#
+# So OnBootSec alone only anchors this timer when you log in within its window
+# of boot. In the session that failed, the machine booted at 18:17:16 and the
+# user manager started at 18:19:44 -- 2.5 minutes later, with OnBootSec=2min
+# (the interval at the time) already in the past and OnUnitActiveSec having no
+# previous activation to anchor to, since the service had never run in that
+# session. The session that worked had the manager start ~2 seconds after
+# boot. OnStartupSec always lies in the future at manager start, so the timer
+# is anchored regardless of how late the login happens.
+OnBootSec=30s
+OnStartupSec=30s
+OnUnitActiveSec=30s
+
+# Required for a sub-minute tick, not a nicety: AccuracySec= defaults to 1min,
+# and systemd places each elapse at a randomized point within that window to
+# coalesce wake-ups. Left at the default, a 30s interval would be scattered
+# across a 60s window -- the tick would not actually be 30 seconds. 1s keeps
+# the interval meaningful without asking for microsecond-accurate wake-ups.
+AccuracySec=1s
+
+# Deliberately no Persistent=yes: systemd.timer(5) states it "only has an
+# effect on timers configured with OnCalendar=", so on a purely monotonic
+# timer like this one it was inert -- it implied a catch-up guarantee that was
+# never actually in force.
+
+[Install]
+WantedBy=timers.target
