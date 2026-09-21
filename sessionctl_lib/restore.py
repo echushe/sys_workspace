@@ -19,6 +19,7 @@ import subprocess
 TERMINAL_APP = "gnome-terminal"
 VSCODE_APP = "code"
 CHROME_APP = "google-chrome"
+WARP_APP = "warp-terminal"
 
 
 def _tab_script(tab):
@@ -106,6 +107,47 @@ def chrome_commands(chrome, use_recorded_urls=False):
             argv += urls
         commands.append(argv)
     return commands
+
+
+def warp_commands(warp_state, running=False, force=False):
+    """At most one argv: launch Warp so it can restore its own session.
+
+    Warp is the one terminal here that needs no reconstruction. Its
+    ``general.restore_session`` setting -- boolean, documented in Warp's own
+    settings schema as "Whether to restore the previous session when Warp
+    starts up", and **default true** -- rebuilds every window, tab, pane,
+    split and cwd from the same ``warp.sqlite`` the collector reads. So the
+    whole restore is "start Warp", and everything sessionctl recorded is there
+    to place those windows on the right GNOME workspace afterwards, which is
+    the part Warp itself has no concept of.
+
+    `running` is whether Warp is running *now*, which the caller supplies
+    (cli passes warp.running()). It deliberately does not come from the
+    snapshot: the snapshot records whether Warp was running when the session
+    was *saved*, which after a reboot is almost always true and would mean
+    Warp never got launched at all -- the one case this whole function exists
+    for. Keeping the live lookup in the caller also keeps this module free of
+    process inspection, so every argv it builds stays unit-testable and
+    --dry-run stays side-effect-free.
+
+    Nothing is launched when Warp is already running. There is no flag or URI
+    to ask a running Warp for a pane at a path (checked: ``--help`` exposes no
+    window/tab options, and the binary carries only ``warp://cli`` and
+    ``warp://linear``), so a second invocation cannot add the recorded panes
+    to a live instance -- it would at best raise another window sessionctl
+    then has to place, at worst nothing at all. `force` overrides that for the
+    case where you have quit Warp yourself between `save` and `restore`; it
+    exists because "is it running" is a race, not a certainty.
+
+    Returns [] when the snapshot recorded no Warp session at all, so a desktop
+    that never used Warp never launches it.
+    """
+    state = warp_state or {}
+    if not state.get("windows"):
+        return []
+    if running and not force:
+        return []
+    return [[WARP_APP]]
 
 
 def launch(argv):

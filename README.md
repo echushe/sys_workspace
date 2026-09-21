@@ -18,6 +18,7 @@ Step 6 of 7 from the plan's implementation order.
 | `restore` | **done, verified live end to end** |
 | Workspace layout (`place`) | **done, verified live end to end; one further bug found by a real restore and fixed** |
 | systemd units, `setup` | **done, `setup` run for real and verified live across four separate reboots** |
+| Warp terminal (capture + restore) | **done, verified live against the running Warp** -- capture, signatures and matching exercised end to end against four real windows; the reboot cycle itself is not yet verified |
 
 `setup` was run for real (not just `--dry-run`): the save timer is enabled,
 and Chrome's `restore_on_startup` got set once Chrome happened to be closed.
@@ -70,6 +71,33 @@ gnome-terminal's D-Bus API" is not "not on this machine". The accessibility
 tree exposes one frame per window and one page tab per tab, and a real save
 now records `[1, 5, 5, 4, 5]` where it used to write `[4, 4, 4, 4, 4]`. Full
 account under Tests, below.
+
+**Warp terminal is captured and restored too, and it inverted the usual
+difficulty.** Every other terminal here had to be reconstructed from partial
+views; Warp keeps a relational record of its own session in
+`~/.local/state/warp-terminal/warp.sqlite` -- `windows` -> `tabs` ->
+`pane_nodes` -> `terminal_panes`, with the split tree alongside. The
+tab-to-window mapping this project fought AT-SPI for is a foreign key there,
+and `terminal_panes.cwd` tracks the *current* directory, not the launch one
+(proven by a natural experiment already in the data: a pane whose
+`WARP_INITIAL_WORKING_DIR` was `/home/shengcn` had the project directory it
+had since moved to recorded in its row). Because Warp's own
+`general.restore_session` defaults to true and rebuilds windows, tabs, panes,
+splits and cwds from that same database, restore is the Chrome pattern rather
+than the gnome-terminal one: launch the app and let it restore itself, then
+place its windows on the GNOME workspaces it has no concept of. Full account
+under [Warp terminal](#warp-terminal), below.
+
+One assumption did not survive checking, and it is the kind that fails
+silently: Warp does **not** source `~/.bashrc`. Its bash bootstrap sources
+*login* files -- `/etc/profile`, then the first of `~/.bash_profile`,
+`~/.bash_login`, `~/.profile` -- which is the exact opposite of
+gnome-terminal here, whose profile is `login-shell=false`. The hook reaches
+Warp panes only because this machine's `~/.profile` carries the
+distribution's stock "include .bashrc" block and no `~/.bash_profile` exists
+to shadow it. `setup` now checks that chain and says so, because creating a
+`~/.bash_profile` for unrelated reasons would break conda capture in Warp
+while leaving gnome-terminal working perfectly.
 
 `restore` has been run for real (not just `--dry-run`) against a live
 snapshot: it opened a new gnome-terminal window with the correct cwd and
@@ -198,6 +226,8 @@ true, and a prompt that cannot be answered would surface as an ordinary
 ./sessionctl restore                        # actually relaunch terminals/VSCode/Chrome
 ./sessionctl restore --snapshot ID          # restore a specific snapshot, not latest
 ./sessionctl restore --only vscode,chrome   # restore a subset
+                             #   (terminals, warp, vscode, chrome, layout)
+./sessionctl restore --warp-force           # launch Warp even if it's running
 ./sessionctl restore --chrome-urls          # open Chrome's recorded URLs explicitly
 ./sessionctl restore --skip-mounts          # skip Stage 0 (you've already mounted)
 
@@ -217,6 +247,10 @@ true, and a prompt that cannot be answered would surface as an ordinary
 ./sessionctl uninstall --yes                # actually reverse it (refuses without --yes)
 ./sessionctl uninstall --yes --purge        # also delete snapshots and config
 ```
+
+`save` also records Warp's own session -- every window, tab, pane, split and
+per-pane cwd, read straight out of Warp's database, plus each pane's conda env
+from the shell hook. See [Warp terminal](#warp-terminal).
 
 `save` captures every window's workspace, geometry, maximized state and
 sticky flag via Wnck -- not just windows sessionctl launches. `place` re-binds
@@ -374,6 +408,145 @@ root is always mounted. Several paths on one device collapse into one entry, so
 With no config file, commands fall back to live detection, so the tool works
 before `detect --write` has ever run.
 
+## Warp terminal
+
+Warp is captured and restored alongside gnome-terminal, and the split of
+labour is different because Warp's own record is better than anything
+sessionctl could reconstruct.
+
+**What Warp gives us.** `~/.local/state/warp-terminal/warp.sqlite` is a real
+relational session record: `windows` (with `active_tab_index`, geometry and
+fullscreen state) -> `tabs` -> `pane_nodes` -> `terminal_panes` (with `cwd`
+and the shell), plus `pane_branches`/`pane_leaves` for the split tree and
+which pane is focused. So the tab-to-window mapping is a foreign key rather
+than a heuristic -- the thing that cost this project an accessibility-tree
+detour for gnome-terminal is free here, and exact. Two facts about that
+database were checked rather than assumed:
+
+- `terminal_panes.cwd` is the **current** directory, not the launch one. A
+  natural experiment was already sitting in the data: a pane whose shell had
+  `WARP_INITIAL_WORKING_DIR=/home/shengcn` had
+  `/home/shengcn/Projects/finance/stock_03_claude` in its row, which is where
+  that shell had since been `cd`'d to.
+- The cwd is stored in **logical** form (`~/Projects/...`, symlink intact)
+  while `/proc/<pid>/cwd` resolves to the physical `/media/shengcn/...` path.
+  Same directory, different strings; nothing may compare them for equality.
+
+It is read `mode=ro` and never `immutable=1`. Immutable would make SQLite
+ignore the write-ahead log and quietly serve state from the last checkpoint;
+read-only takes read locks only and cannot write, checkpoint or recover, which
+is what makes it safe against a database Warp has open. Both `warp.sqlite`
+**and** `warp.sqlite-wal` are stat'd for the write-avoidance skip, because
+Warp runs in WAL mode (confirmed: `pragma journal_mode` returns `wal`) and a
+committed change can sit in the log with the main file's mtime untouched.
+
+**What Warp doesn't give us: the conda env.** `shell_launch_data` records only
+the executable (`/bin/bash`), and no database column could hold more --
+`conda activate` mutates the running shell and never re-execs, which is the
+same reason `bash-hook.sh` exists at all. So the hook now reports Warp panes
+too, and the join is exact rather than positional:
+`WARP_TERMINAL_SESSION_UUID`, which Warp exports into every pane's shell, is
+the hex of `terminal_panes.uuid`. Verified one-to-one -- all nine live pane
+shells matched all nine rows.
+
+**Warp does not source `~/.bashrc`.** Its bootstrap sources login files:
+`/etc/profile` (or `/etc/bash.bashrc`), then the first of `~/.bash_profile`,
+`~/.bash_login`, `~/.profile`. That is the opposite of gnome-terminal here,
+whose default profile is `login-shell=false` and so reads `~/.bashrc` and
+never `~/.profile`. The hook reaches Warp panes over a two-hop chain --
+Warp -> `~/.profile` -> `~/.bashrc` -- which holds only because this machine's
+`~/.profile` has the distribution's stock `if [ -n "$BASH_VERSION" ]; then
+. "$HOME/.bashrc"` block and nothing shadows it. Creating a `~/.bash_profile`
+later is enough to break it, silently and only in Warp, so `setup` checks the
+chain and reports it. One useful side effect of Warp being a login shell:
+`~/.local/bin` *is* on `PATH` in a Warp pane, so the bare `sessionctl` command
+works there even though it does not in a new gnome-terminal tab (see the note
+at the end of `setup`'s section).
+
+Warp's bootstrap also constrains how the hook may install itself. It re-homes
+the user's `PROMPT_COMMAND` into its own bash-preexec chain, but only after
+this test, lifted verbatim from the shipped binary:
+
+```sh
+if [[ ! $PROMPT_COMMAND =~ "PROMPT_COMMAND=" ]]; then
+```
+
+It inspects the *value*, so the hook's `PROMPT_COMMAND="_sessionctl_save; ..."`
+is honoured -- confirmed by replaying Warp's own bootstrap logic around the
+real hook file, which reported it captured and wrote a pane's state file. A
+future edit that put the literal `PROMPT_COMMAND=` into the value would
+silently disable the hook in Warp only.
+
+**Restore is Warp's job, not sessionctl's.** `general.restore_session` is
+documented in Warp's own settings schema (`warp-terminal
+dump-settings-schema`) as "Whether to restore the previous session when Warp
+starts up", boolean, **default true**, and it rebuilds windows, tabs, panes,
+splits and cwds from the same database. So `restore` launches `warp-terminal`
+if Warp isn't already running and stops there -- the Chrome pattern. Whether
+Warp is running is read *now*, never from the snapshot: the snapshot records
+whether Warp was up when the session was **saved**, which after a reboot is
+almost always true and would skip the one launch that matters.
+
+Nothing is launched when Warp is already running, because there is nothing
+useful to launch: `warp-terminal --help` exposes no window, tab or session
+options at all (its subcommands are agent, cloud, MCP and auth management),
+the binary carries only two `warp://` routes -- `warp://cli` and
+`warp://linear` -- and this version has no launch-configuration file support.
+`--warp-force` overrides the check for the case where Warp was quit between
+`save` and `restore`.
+
+Unlike Chrome's, Warp's preference is **reported, not written**. `setup` edits
+Chrome's `Preferences` because Chrome ships that setting off and restore
+depends on turning it on; Warp's equivalent already defaults to true and is
+absent from `settings.toml` entirely on this machine, so there is nothing to
+write. Writing anyway would mean hand-editing a live TOML file (Python 3.10
+has no `tomllib`, and `/usr/bin/python3` is deliberately what this runs under)
+to set a value already in force. So `setup` only speaks up when the setting
+has actually been turned off, and then says where to turn it back on.
+
+**Placing Warp windows is the part only sessionctl can do**, since Warp stores
+its own x/y/size but has no concept of a GNOME workspace. Warp windows have
+exactly gnome-terminal's matching problem -- one `wm_class`
+(`dev.warp.Warp`), one shared PID for every window, identical maximized
+geometry, and repeated titles (two of the four live windows were both
+`~/Projects/ZERO`) -- so they now carry the same `{tabs, cwds}` signature
+gnome-terminal windows do, which means `match_windows` needed no Warp-specific
+case. The difference is where it comes from: Warp's is read from its database
+and is exact whatever the panes are running, while gnome-terminal's is read
+off prompts and is blind to any tab that isn't sitting at one.
+
+That signature is paired to X11 windows **by content, never by position**, and
+that distinction is not cosmetic. Warp's window ids do not line up with XID
+order: sorted by XID the live windows read `stock_03_claude, ZERO, ~, ZERO`,
+while database ids 1-4 read `stock_03_claude, ZERO, ZERO, ~`. Pairing them
+index-for-index -- the way terminal signatures pair AT-SPI frames with
+XID-sorted windows -- would have handed two windows each other's signatures,
+silently. Instead each database window is matched to the live window whose
+title it predicts (Warp titles a window after the focused pane of its active
+tab, or that tab's custom title), exact titles first and then Warp's elided
+form, since Warp cuts the front off a long path mid-segment:
+`..s/finance/stock_03_claude`. Anything left unpaired gets no signature rather
+than a guessed one, and the whole map is abandoned if the two views disagree
+on how many windows there are -- the same degrade-never-guess policy the
+terminal path uses.
+
+Verified live against the real four-window session: all four paired correctly
+including the elided title, the three-tab `~` window got `{tabs: 3}` and so is
+now positively identified rather than relying on title similarity, and
+`match_windows` bound all four recorded rows to the right live windows. Under
+`strict` it correctly deferred the two genuinely identical `~/Projects/ZERO`
+windows instead of coin-flipping them, which is the documented settle-window
+behaviour.
+
+### Re-run `setup` after upgrading
+
+`bash-hook.sh` is deployed as a real copy, so the Warp half of capture does not
+take effect until `sessionctl setup` redeploys it -- and, as with
+gnome-terminal, only panes opened *after* that pick it up. Panes already open
+keep reporting nothing, so their conda envs read as null until they are
+reopened. Their cwds are unaffected, since those come from Warp's database
+rather than the hook.
+
 ## Optional one-time fix
 
 Adding the partition to `/etc/fstab` makes it mount at boot and reduces
@@ -404,7 +577,7 @@ a machine whose rules require it — see the note under "Scanning `$HOME`".
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-258 tests. Mount branches are stubbed rather than run against real hardware --
+316 tests. Mount branches are stubbed rather than run against real hardware --
 see the section above. Terminal capture, VSCode and Chrome were all exercised
 against real state (a real gnome-terminal tab via `--rcfile`, matching how
 `restore` invokes shells; the real `storage.json`; the real Chrome session
@@ -437,6 +610,35 @@ window. `sessionctl restore --dry-run` was run against a real captured
 snapshot end to end, and then a real, non-dry-run `sessionctl restore` was
 also run (with explicit confirmation first, since it opens real windows) --
 see Status, above, for what that actually did.
+
+Warp's tests build a **real sqlite database** using Warp's own DDL for the
+columns being read, rather than mocking query results: the multi-table join
+from `windows` down to `terminal_panes` is the part worth testing, and a mock
+of `conn.execute` would only assert that the test agrees with itself. A rename
+in Warp's schema should break these tests, because it would break the
+collector. Covered there and not reachable live: an unreadable or locked
+database degrading to an empty record instead of taking down the whole save, a
+window Warp has not sized yet reading as unknown geometry rather than a window
+at the origin, the source-skip still re-joining conda (a pane that only ran
+`conda activate` leaves both files' mtime and size untouched, so returning the
+cached record verbatim would hold a stale env forever), and the read-only
+connection genuinely refusing a write.
+
+Two Warp findings came out of writing those tests rather than out of running
+the code, and both are recorded above because they are the sort that fail
+silently: the database's window ids not lining up with XID order, and Warp
+sourcing login files instead of `~/.bashrc`.
+
+One Warp hazard is a **data-loss** guard rather than a correctness one, and it
+has its own test. Warp panes and gnome-terminal tabs write into the same
+`shells/` directory, and `read_shell_records` deletes what it judges dead --
+so judging a Warp pane's record by gnome-terminal's rules (no
+`GNOME_TERMINAL_SCREEN`, parent not `gnome-terminal-server`) would have
+deleted a live pane's record, and its conda env with it, on the very next
+save. Validation is therefore per-kind and happens *before* the caller's kind
+filter is applied. Records written before the hook learned about Warp carry no
+`kind` at all and read as gnome-terminal, so a snapshot taken across the
+upgrade stays readable instead of quietly losing its terminals.
 
 `layout.py` needed live testing to find bugs no unit test could reach at all:
 Wnck's action methods (`move_to_workspace`, `maximize`, `set_geometry`, `pin`)

@@ -127,9 +127,10 @@ the deployed copy, not from this tree.
     paths.py                        #   XDG paths, snapshot dir handling
     mounts.py                       #   Stage 0: ensure storage is mounted
     collect.py                      #   terminals / vscode / browsers
+    warp.py                         #   Warp's own session db (sqlite, read-only)
     layout.py                       #   workspace + geometry capture/replay (Wnck)
     restore.py                      #   replay logic
-    setup.py                        #   symlink deployment, systemd units, Chrome prefs
+    setup.py                        #   symlink deployment, systemd units, Chrome/Warp prefs
     cli.py                          #   argparse, subcommands
   bash-hook.sh
   systemd/  sessionctl-save.{service,timer}
@@ -648,7 +649,39 @@ can be re-applied without relaunching anything.
    a snapshot may carry the title a window had at the last *substantive* change. This
    is deliberate and safe — titles are only a secondary matching hint — but it means
    `sessionctl show` may display a stale title for a window whose content moved on.
-11. **`udisksctl` may prompt for a password.** `/dev/nvme0n1p6` is an internal,
+11. **A Warp pane's conda env is captured but cannot be replayed.** This is the
+   one place Warp support falls short of gnome-terminal, and it is a hard limit
+   rather than an omission. Warp restores its own panes from its own database,
+   and there is no way to hand a restored pane a command or an environment:
+   `warp-terminal --help` exposes no window/tab/session options, the binary
+   carries only `warp://cli` and `warp://linear`, and this version has no
+   launch-configuration file support. All three were checked before concluding
+   it. So a restored Warp pane comes back in the right directory with no conda
+   env, and `sessionctl show` is the only place the recorded env can be seen.
+   Nothing speculative was built to work around this: the obvious trick --
+   keying envs by cwd and having the hook activate them in new panes -- would
+   fire in panes the user opened themselves, and could not be verified without
+   disrupting a live session.
+12. **Warp restore depends on a Warp setting sessionctl does not write.**
+   `general.restore_session` defaults to true and is what actually rebuilds the
+   session; if it is turned off, `restore` can only launch an empty Warp. `setup`
+   reports the setting but deliberately does not edit `settings.toml` (see the
+   README for why writing a value already in force is not worth hand-editing a
+   live TOML file for).
+13. **Warp windows with identical content stay interchangeable.** The signature
+   is exact, but two windows holding the same number of tabs in the same
+   directories -- as two of the four live windows genuinely did, both one tab in
+   `~/Projects/ZERO` -- are indistinguishable by it, by title, by class and by
+   PID. Either assignment produces the same visible result unless their recorded
+   workspaces differ, in which case they can swap. This is the same
+   same-class-shuffle limitation as item 6, not a new one.
+14. **The Warp hook path is one `~/.bash_profile` away from breaking.** Warp
+   sources login files, not `~/.bashrc`, so the hook reaches Warp panes only via
+   `~/.profile`'s stock "include .bashrc" block. Creating a `~/.bash_profile`
+   shadows that and silently ends conda capture in Warp while leaving
+   gnome-terminal working. `setup` checks and reports the chain; it does not
+   repair it.
+15. **`udisksctl` may prompt for a password.** `/dev/nvme0n1p6` is an internal,
    non-removable drive, so PolicyKit can require admin auth to mount it. Stage 0 will
    then be interactive. The `/etc/fstab` entry above removes this entirely.
 
@@ -686,7 +719,19 @@ can be re-applied without relaunching anything.
 11. Dynamic-workspace edge case: close everything on WS1 and WS2 so only WS0 and a
    high-index workspace are occupied, snapshot, then `sessionctl place --dry-run` and
    confirm the compaction remap is reported rather than an unreachable index.
-12. Full test: reboot, then `sessionctl restore`.
+12. Warp capture: `sessionctl show latest` must list every Warp window with its
+   tabs, panes, splits and per-pane cwd, and each window's `sig` in the layout
+   section must carry that window's real tab count -- the three-tab `~` window
+   reading `{tabs: 3}` is the check that the content-based pairing worked and
+   did not fall back to database order. Open a new Warp pane, `conda activate`
+   in it, and confirm that pane (and only that pane) gains a conda env.
+13. Warp restore, the part not yet done: reboot with Warp open, then
+   `sessionctl restore` -- Warp should be relaunched, restore its own windows
+   and panes, and have those windows placed back on their recorded workspaces.
+   What has been verified so far is each half separately: the launch decision
+   (`--only warp`, with and without `--warp-force`, against a real snapshot) and
+   the matching of all four recorded Warp rows to the four live windows.
+14. Full test: reboot, then `sessionctl restore`.
 
 ## Implementation order
 

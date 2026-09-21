@@ -15,7 +15,10 @@ import os
 
 from . import paths
 
-VERSION = 1
+# 2 adds the "warp" section. Nothing reads this field -- it is here so a
+# snapshot found on disk says which shape it is, and so an older one is
+# recognisable as predating Warp capture rather than as a Warp-less desktop.
+VERSION = 2
 KEEP = 20
 
 
@@ -133,7 +136,8 @@ def session_not_yet_restored(previous, boot_id, restored_boot):
     return restored_boot != boot_id
 
 
-def build(terminals, mounts_state, vscode=None, chrome=None, firefox=None, layout=None):
+def build(terminals, mounts_state, vscode=None, chrome=None, firefox=None,
+          layout=None, warp=None):
     return {
         "version": VERSION,
         "ts": _now_iso(),
@@ -144,6 +148,7 @@ def build(terminals, mounts_state, vscode=None, chrome=None, firefox=None, layou
         "vscode": vscode or {"windows": []},
         "chrome": chrome or {"profiles": []},
         "firefox": firefox or {"running": False, "profile": None},
+        "warp": warp or {"running": False, "windows": []},
         "layout": layout or {"workspace_count": 0, "windows": []},
     }
 
@@ -210,6 +215,28 @@ def digest(snap):
         "chrome": sorted(
             (p.get("profile", ""), tuple(p.get("urls", [])))
             for p in snap.get("chrome", {}).get("profiles", [])
+        ),
+        # Warp's pane directories and conda envs, per window, with tab count.
+        # Restore itself consumes almost none of this -- Warp rebuilds its own
+        # panes -- so by the letter of "only what a restore consumes" this
+        # could have been just a count. It is here because two things do
+        # consume it. Placement matches Warp windows on exactly this content
+        # (layout._warp_signatures), so leaving it out would let a snapshot
+        # keep stale signatures and place windows by directories they had left;
+        # and `show` is the only place a Warp pane's conda env is ever visible,
+        # since Warp cannot restore it. Window ids are excluded: Warp reassigns
+        # them freely, and including them would rewrite a snapshot for a
+        # session that had not changed.
+        "warp": sorted(
+            (
+                len(w.get("tabs") or []),
+                tuple(sorted(
+                    (p.get("cwd") or "", p.get("conda") or "")
+                    for tab in w.get("tabs") or []
+                    for p in tab.get("panes") or []
+                )),
+            )
+            for w in snap.get("warp", {}).get("windows", [])
         ),
         "firefox": snap.get("firefox", {}).get("running", False),
         "layout": sorted(

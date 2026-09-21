@@ -7,9 +7,10 @@ import os
 import shlex
 import sys
 
-from . import collect, config, layout, mounts, paths, restore, setup, snapshot
+from . import (collect, config, layout, mounts, paths, restore, setup,
+               snapshot, warp)
 
-RESTORE_KINDS = ("terminals", "vscode", "chrome", "layout")
+RESTORE_KINDS = ("terminals", "warp", "vscode", "chrome", "layout")
 
 
 def _mounts_state():
@@ -77,7 +78,7 @@ def cmd_detect(args):
     return 0
 
 
-def _capture_layout(terminals=None):
+def _capture_layout(terminals=None, warp_state=None):
     """layout.capture(), degrading to empty rather than crashing `save`.
 
     Wnck needs a working X11 DISPLAY. That's guaranteed in an interactive
@@ -89,7 +90,7 @@ def _capture_layout(terminals=None):
     and leaving layout empty for that one run.
     """
     try:
-        return layout.capture(terminals)
+        return layout.capture(terminals, warp_state)
     except Exception as e:
         print(f"warning: layout capture failed ({e}), continuing without it", file=sys.stderr)
         return {"workspace_count": 0, "windows": []}
@@ -173,10 +174,19 @@ def cmd_save(args):
     vscode = collect.collect_vscode(previous=previous.get("vscode"))
     chrome = collect.collect_chrome(previous=previous.get("chrome"))
     firefox = collect.collect_firefox()
-    # The terminals collection is handed to layout capture so terminal
-    # windows get their tab signature from the shell hook rather than from
-    # whatever their prompts happen to show -- see layout._hook_window_cwds.
-    layout_state = _capture_layout(terminals)
+    # Warp records its own windows/tabs/panes/cwds, so this is a database read
+    # rather than a reconstruction. The shell hook still supplies the one thing
+    # Warp cannot see -- each pane's conda env -- joined on the pane UUID.
+    warp_state = warp.collect_warp(
+        previous=previous.get("warp"),
+        shells=collect.read_warp_shells(prune=not args.no_prune),
+    )
+    # Both collections are handed to layout capture so terminal and Warp
+    # windows get a trustworthy signature -- from the shell hook rather than
+    # from whatever their prompts happen to show (layout._hook_window_cwds),
+    # and from Warp's own database rather than from a repeated title
+    # (layout._warp_signatures).
+    layout_state = _capture_layout(terminals, warp_state)
 
     # Third refusal, same family as the two above: this run could not see the
     # desktop at all while the previous one could, so whatever it captured is
@@ -193,7 +203,8 @@ def cmd_save(args):
               file=sys.stderr)
         return 0
 
-    snap = snapshot.build(terminals, state, vscode, chrome, firefox, layout_state)
+    snap = snapshot.build(terminals, state, vscode, chrome, firefox,
+                          layout_state, warp_state)
 
     tab_count = sum(len(w["tabs"]) for w in terminals["windows"])
     if args.dry_run:
@@ -204,8 +215,11 @@ def cmd_save(args):
     vs_count = len(vscode["windows"])
     chrome_count = sum(len(p["urls"]) for p in chrome["profiles"])
     win_count = len(layout_state["windows"])
+    warp_panes = warp.pane_count(warp_state)
+    warp_windows = len(warp_state.get("windows", []))
     summary = (
-        f"{tab_count} tabs, {vs_count} vscode windows, "
+        f"{tab_count} tabs, {warp_panes} warp panes in {warp_windows} windows, "
+        f"{vs_count} vscode windows, "
         f"{chrome_count} chrome urls, {win_count} windows placed"
     )
 
@@ -321,6 +335,16 @@ def cmd_restore(args):
     if "terminals" in only:
         for argv in restore.terminal_commands(snap.get("terminals", {})):
             plan.append(("terminal", argv))
+    if "warp" in only:
+        # warp.running() is read now, not taken from the snapshot: the snapshot
+        # says whether Warp was up when the session was saved, which after a
+        # reboot is nearly always true and would skip the launch entirely.
+        for argv in restore.warp_commands(
+            snap.get("warp", {}),
+            running=warp.running(),
+            force=args.warp_force,
+        ):
+            plan.append(("warp", argv))
     if "vscode" in only:
         for argv in restore.vscode_commands(snap.get("vscode", {})):
             plan.append(("vscode", argv))
@@ -528,6 +552,25 @@ def cmd_show(args):
             env = f"({t['conda']}) " if t.get("conda") else ""
             print(f"  {env}{t.get('cwd')}")
 
+    warp_windows = snap.get("warp", {}).get("windows", [])
+    if warp_windows:
+        state = "running" if snap.get("warp", {}).get("running") else "not running"
+        print(f"\nwarp ({state}):")
+        for w in warp_windows:
+            active = w.get("active_tab_index")
+            print(f"  window {w.get('id')} (active tab {active}):")
+            for i, tab in enumerate(w.get("tabs") or []):
+                panes = tab.get("panes") or []
+                split = ""
+                if len(panes) > 1:
+                    split = " split-h" if tab.get("split_horizontal") else " split-v"
+                title = f" {tab['custom_title']!r}" if tab.get("custom_title") else ""
+                print(f"    tab {i}{title}{split}:")
+                for pane in panes:
+                    env = f"({pane['conda']}) " if pane.get("conda") else ""
+                    mark = "*" if pane.get("focused") else " "
+                    print(f"     {mark} {env}{pane.get('cwd')}")
+
     vs_windows = snap.get("vscode", {}).get("windows", [])
     if vs_windows:
         print("\nvscode:")
@@ -655,6 +698,12 @@ def build_parser():
     r.add_argument(
         "--skip-mounts", action="store_true",
         help="skip Stage 0 (you've already mounted things yourself)",
+    )
+    r.add_argument(
+        "--warp-force",
+        action="store_true",
+        help="launch Warp even if it is already running (it restores its own "
+             "session on startup, so this normally does nothing useful)",
     )
     r.add_argument(
         "--chrome-urls", action="store_true",

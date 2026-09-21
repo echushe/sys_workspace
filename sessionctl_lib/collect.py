@@ -12,6 +12,10 @@ from . import paths
 
 TERMINAL_SERVER = "gnome-terminal-server"
 
+# Warp's process name, and the parent of every pane shell. Read off the live
+# desktop: `warp terminal-server` reports comm "warp".
+WARP_SERVER = "warp"
+
 VSCODE_STORAGE = os.path.expanduser(
     "~/.config/Code/User/globalStorage/storage.json"
 )
@@ -78,16 +82,20 @@ def dbus_tree():
     return screens, windows
 
 
-def _is_live_tab(rec, live_screens):
-    """Is this shell record still a real, running gnome-terminal tab?
+def record_kind(rec):
+    """Which terminal a shell record came from: "gnome" or "warp".
 
-    The environ check is what makes PID reuse safe: a stale file naming a dead
-    PID that the kernel has since handed to an unrelated process would
-    otherwise be taken at face value.
+    Records written before the hook learned about Warp have no "kind" at all,
+    and every one of those is a gnome-terminal tab -- so the absent value
+    reads as "gnome" rather than being discarded. That keeps a snapshot taken
+    across the upgrade readable instead of quietly losing its terminals.
     """
-    pid = rec.get("pid")
-    if not isinstance(pid, int) or not os.path.isdir(f"/proc/{pid}"):
-        return False
+    return rec.get("kind") or "gnome"
+
+
+def _is_live_gnome_tab(rec, live_screens):
+    """Is this record still a real, running gnome-terminal tab?"""
+    pid = rec["pid"]
     if _proc_environ(pid).get("GNOME_TERMINAL_SCREEN") != rec.get("screen"):
         return False
     parent = _parent_comm(pid)
@@ -99,10 +107,68 @@ def _is_live_tab(rec, live_screens):
     return True
 
 
-def read_shell_records(prune=False):
+def _is_live_warp_pane(rec):
+    """Is this record still a real, running Warp pane?
+
+    Same shape of check as the gnome-terminal one, against Warp's equivalents:
+    the per-pane UUID Warp exports into the shell's environment, and the
+    parent process being Warp itself. Verified on the live desktop -- all nine
+    pane shells had ppid pointing at `warp terminal-server`, whose comm is
+    exactly "warp" (short enough that /proc/<pid>/comm's 15-byte truncation,
+    which once broke the gnome-terminal-server check, cannot bite here).
+
+    A plain `bash` run *inside* a pane inherits that pane's UUID, so it would
+    otherwise be recorded as a second pane with the same identity and could
+    overwrite the real pane's conda env. Its parent is the outer bash, not
+    Warp, so this rejects it -- which is also why nested shells are simply not
+    captured, exactly as for gnome-terminal.
+    """
+    pid = rec["pid"]
+    uuid = rec.get("warp_uuid")
+    if not uuid:
+        return False
+    return (
+        _proc_environ(pid).get("WARP_TERMINAL_SESSION_UUID") == uuid
+        and _parent_comm(pid) == WARP_SERVER
+    )
+
+
+def _is_live_tab(rec, live_screens):
+    """Is this shell record still a real, running tab or pane of its own kind?
+
+    Judging every record by gnome-terminal's rules is not merely inaccurate,
+    it destroys data: read_shell_records prunes what it judges dead, so a Warp
+    pane's record -- which has no GNOME_TERMINAL_SCREEN and whose parent is
+    not gnome-terminal-server -- would be deleted on the next save while the
+    pane was still open, taking its conda env with it. So the kind decides
+    which checks apply, and an unrecognised kind is left alone rather than
+    validated by rules that cannot fit it.
+
+    The PID liveness check is common to both, and is what makes PID reuse
+    safe: a stale file naming a dead PID that the kernel has since handed to
+    an unrelated process would otherwise be taken at face value.
+    """
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or not os.path.isdir(f"/proc/{pid}"):
+        return False
+    kind = record_kind(rec)
+    if kind == "warp":
+        return _is_live_warp_pane(rec)
+    if kind == "gnome":
+        return _is_live_gnome_tab(rec, live_screens)
+    return False
+
+
+def read_shell_records(prune=False, kind=None):
     """Load and validate the per-tab files written by bash-hook.sh.
 
-    With prune=True, files for tabs that are gone are deleted.
+    With prune=True, files for tabs that are gone are deleted. Each record is
+    validated against its own terminal's rules first (see _is_live_tab), so
+    pruning never deletes a live record just because the caller asked for a
+    different kind.
+
+    kind filters what is returned -- "gnome", "warp", or None for everything.
+    The filter is applied after validation for that reason.
     """
     live_screens, _ = dbus_tree()
     records = []
@@ -114,10 +180,26 @@ def read_shell_records(prune=False):
             if prune:
                 _unlink(path)
             continue
-        if _is_live_tab(rec, live_screens):
+        if not _is_live_tab(rec, live_screens):
+            if prune:
+                _unlink(path)
+            continue
+        if kind is None or record_kind(rec) == kind:
             records.append(rec)
-        elif prune:
-            _unlink(path)
+    return records
+
+
+def read_warp_shells(prune=False):
+    """Live Warp pane records from the shell hook, newest write last.
+
+    Sorted by the hook's own timestamp so that if two records somehow claim
+    the same pane UUID, the later one wins when they are folded into a
+    uuid -> conda map (see warp._conda_by_uuid). Nested shells are already
+    rejected upstream, so this is a tie-break for the unexpected rather than
+    the normal path.
+    """
+    records = read_shell_records(prune=prune, kind="warp")
+    records.sort(key=lambda r: (r.get("ts") or 0, r.get("pid") or 0))
     return records
 
 
@@ -140,7 +222,11 @@ def collect_terminals(prune=True):
     split, which is exact only for equal-sized windows -- see the plan's
     limitations.
     """
-    records = read_shell_records(prune=prune)
+    # Warp panes write into the same directory and must not be counted as
+    # gnome-terminal tabs: their number would inflate the tab count, and a
+    # desktop with Warp open but no gnome-terminal would look like a
+    # gnome-terminal session whose windows had all vanished.
+    records = read_shell_records(prune=prune, kind="gnome")
     records.sort(key=lambda r: r["pid"])
 
     tabs = [

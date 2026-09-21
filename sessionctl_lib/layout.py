@@ -16,7 +16,7 @@ gi.require_version("Wnck", "3.0")
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Wnck  # noqa: E402
 
-from . import collect  # noqa: E402
+from . import collect, warp  # noqa: E402
 
 DEFAULT_TIMEOUT = 45.0
 POLL_INTERVAL = 0.3
@@ -184,6 +184,116 @@ def _terminal_signatures(windows, terminals=None):
     }
 
 
+def _warp_title_candidates(window):
+    """What Warp may be showing in this window's title bar.
+
+    Warp titles a window after the active tab: its custom title if the user
+    set one, otherwise the ~-abbreviated cwd of that tab's focused pane.
+    Verified against all four live windows -- the database's active tab and
+    focused pane predicted every title exactly, including which of two
+    identical-looking windows was which.
+    """
+    tabs = window.get("tabs") or []
+    if not tabs:
+        return []
+    index = window.get("active_tab_index") or 0
+    tab = tabs[index] if 0 <= index < len(tabs) else tabs[0]
+    candidates = []
+    if tab.get("custom_title"):
+        candidates.append(tab["custom_title"])
+    cwd = warp.active_cwd(window)
+    if cwd:
+        candidates.append(cwd)
+    return candidates
+
+
+def _warp_title_matches(candidate, title):
+    """Does a live Warp window title correspond to this candidate string?
+
+    Not plain equality, because Warp elides the front of a long path: a pane
+    in ~/Projects/finance/stock_03_claude titles its window
+    "..s/finance/stock_03_claude", cutting mid-segment rather than at a "/".
+    So an elided title is compared as a suffix of the full candidate.
+    """
+    if not candidate or not title:
+        return False
+    if candidate == title:
+        return True
+    if title.startswith(warp.TITLE_ELLIPSIS):
+        tail = title[len(warp.TITLE_ELLIPSIS):]
+        return bool(tail) and candidate.endswith(tail)
+    return False
+
+
+def _warp_signatures(windows, warp_state):
+    """Map XID -> tab signature for every Warp window.
+
+    Warp windows have exactly the problem gnome-terminal windows have, for
+    exactly the same reasons: one wm_class, one shared PID (all four live
+    windows report the Warp process), identical maximized geometry, and titles
+    that repeat -- two of the four were both titled "~/Projects/ZERO". Without
+    a signature their recorded workspaces would be applied to whichever window
+    came first.
+
+    The pairing is by *content*, not by order, and that distinction is not
+    cosmetic: the database's own window ids do not line up with X11 stacking
+    or XID order. Checked on the live desktop -- sorted by XID the windows
+    read stock_03_claude, ZERO, ~, ZERO, while database ids 1..4 read
+    stock_03_claude, ZERO, ZERO, ~. Pairing them index-for-index, the way
+    _terminal_signatures pairs AT-SPI frames with XID-sorted windows, would
+    have silently handed two windows each other's signatures. So each
+    database window is matched to the live window whose title it predicts,
+    exact titles first and Warp's elided form second, consuming both sides.
+
+    Anything left unpaired gets no signature rather than a guessed one, which
+    degrades it to the class-and-title matching Warp windows had before --
+    same policy as _terminal_signatures returning {} on disagreement. The
+    whole map is abandoned when the two views disagree on how many windows
+    there are, since then neither side can be trusted to be describing the
+    same desktop.
+    """
+    recorded = (warp_state or {}).get("windows") or []
+    live = [
+        w for w in windows
+        if (w.get_class_group_name() or "") == warp.WARP_CLASS
+    ]
+    if not recorded or len(live) != len(recorded):
+        return {}
+
+    remaining = list(recorded)
+    sigs = {}
+    for elided in (False, True):
+        for w in live:
+            if w.get_xid() in sigs:
+                continue
+            title = w.get_name() or ""
+            for rec in remaining:
+                candidates = _warp_title_candidates(rec)
+                if elided:
+                    hit = any(_warp_title_matches(c, title) for c in candidates)
+                else:
+                    hit = title in candidates
+                if hit:
+                    sigs[w.get_xid()] = warp.signature(rec)
+                    remaining.remove(rec)
+                    break
+    return sigs
+
+
+def _window_signatures(live_windows, terminals=None, warp_state=None):
+    """Every signature this desktop can supply, keyed by XID.
+
+    gnome-terminal and Warp windows never collide here -- they have different
+    wm_classes, so each contributes a disjoint set of XIDs -- and both produce
+    the same {"tabs": n, "cwds": [...]} shape, so everything downstream
+    (_signature_score, _identity_score, match_windows) treats them alike
+    without knowing which terminal a window belongs to.
+    """
+    sigs = _terminal_signatures(live_windows, terminals)
+    sigs.update(_warp_signatures(live_windows, warp_state))
+    return sigs
+
+
 def _signature_score(rec_sig, live_sig):
     """How strongly two tab signatures agree: 2 exact, 1 tab count only, 0 no.
 
@@ -259,7 +369,7 @@ def _has_identity(rec):
     return bool(rec.get("sig")) or _vscode_folder(rec.get("title")) is not None
 
 
-def capture(terminals=None):
+def capture(terminals=None, warp_state=None):
     """Snapshot every window Wnck can see: class, title, pid, workspace,
     geometry, maximized, sticky.
 
@@ -267,6 +377,10 @@ def capture(terminals=None):
     only to give terminal windows a trustworthy tab signature -- see
     _hook_window_cwds. Optional: without it the signature falls back to
     whatever the tabs' prompts happen to show.
+
+    `warp_state` is the collect_warp() result for this same save, doing the
+    same job for Warp windows -- see _warp_signatures. Also optional: without
+    it Warp windows are captured like any other window, with no signature.
 
     Captures *every* window, including ones sessionctl doesn't launch
     (Nautilus, Slack, the GNOME Shell overlay) -- title is stored purely as
@@ -276,7 +390,7 @@ def capture(terminals=None):
     """
     screen = _screen()
     live = screen.get_windows()
-    sigs = _terminal_signatures(live, terminals)
+    sigs = _window_signatures(live, terminals, warp_state)
     windows = []
     for w in live:
         ws = w.get_workspace()
@@ -584,6 +698,18 @@ def place(recorded_windows, timeout=DEFAULT_TIMEOUT, static_workspaces=False,
 
     remap = {} if static_workspaces else _compact_workspace_indices(recorded_windows)
 
+    # Read once, not once per poll. Warp's database is the very thing it
+    # restores its panes from, so it already describes the session being
+    # placed -- re-reading it 150 times across a 45-second timeout would cost
+    # a sqlite open per 300ms and tell us nothing new.
+    try:
+        warp_state = warp.collect_warp()
+    except Exception:
+        # Signatures are an optimisation over class+title matching, never a
+        # precondition for it. A Warp install that can't be read must not stop
+        # every other window on the desktop from being placed.
+        warp_state = None
+
     def sort_key(rec):
         ws = rec["workspace"] if static_workspaces else _target_workspace(rec, remap)
         return -1 if ws is None else ws
@@ -600,7 +726,7 @@ def place(recorded_windows, timeout=DEFAULT_TIMEOUT, static_workspaces=False,
             break
         screen = _screen()
         live_windows = screen.get_windows()
-        sigs = _terminal_signatures(live_windows)
+        sigs = _window_signatures(live_windows, warp_state=warp_state)
         live = [
             {
                 "wm_class": w.get_class_group_name() or "",

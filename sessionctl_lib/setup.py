@@ -42,7 +42,7 @@ import json
 import os
 import subprocess
 
-from . import collect
+from . import collect, warp
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONCTL_BIN = os.path.join(REPO_ROOT, "sessionctl")
@@ -312,7 +312,7 @@ def _ensure_package_copy(dst_dir, src_dir, dry_run=False):
     Returns a list of report lines. Collapsed to a single "up to date" line
     when nothing needed to change -- the common case on every re-run once
     the code has stabilized, and one line per module (currently
-    sessionctl_lib has eight) would otherwise be pure noise for it.
+    sessionctl_lib has nine) would otherwise be pure noise for it.
     """
     src_files = sorted(f for f in os.listdir(src_dir) if f.endswith(".py"))
     changes = []
@@ -464,6 +464,49 @@ def set_chrome_restore_on_startup(dry_run=False):
     return report
 
 
+def warp_report():
+    """What Warp's own settings mean for restore. Reports; never writes.
+
+    Deliberately not the Chrome treatment. set_chrome_restore_on_startup
+    edits Chrome's Preferences because Chrome ships that setting *off* and a
+    restore genuinely depends on turning it on. Warp's equivalent,
+    general.restore_session, is documented in Warp's own settings schema as
+    defaulting to **true**, and on this machine it is not in settings.toml at
+    all -- so it is already doing the right thing and there is nothing to
+    write. Writing anyway would mean hand-editing a live TOML file (Python
+    3.10 has no tomllib, and /usr/bin/python3 is deliberately what this runs
+    under) to set a value that is already in force, and would risk mangling a
+    config file to no benefit. So this only speaks up when the setting has
+    actually been turned off, and then tells you where to turn it back on
+    rather than doing it for you.
+    """
+    report = []
+    if not os.path.exists(warp.DB_PATH):
+        return report
+
+    enabled = warp.restore_session_enabled()
+    if enabled is None:
+        report.append(
+            f"warp: could not read {warp.SETTINGS_PATH} -- cannot tell whether "
+            "session restore is on"
+        )
+    elif enabled:
+        report.append("warp: session restore is on (Warp reopens its own windows)")
+    else:
+        report.append(
+            "warp: session restore is OFF in settings.toml -- Warp will start "
+            "empty and `sessionctl restore` cannot rebuild its panes (it has "
+            "no API to). Turn it back on: Settings -> Session -> "
+            '"Restore previous session", or set restore_session = true under '
+            "[general]."
+        )
+
+    ok, message = warp.hook_reaches_panes()
+    report.append(f"warp hook: {message}" if ok
+                  else f"warp hook: WARNING -- {message}")
+    return report
+
+
 def setup(dry_run=False, install_hook=False):
     """Run every setup step. Returns a flat list of report lines."""
     report = []
@@ -498,6 +541,7 @@ def setup(dry_run=False, install_hook=False):
     report.extend(deploy_units(dry_run=dry_run))
     report.extend(enable_units(dry_run=dry_run))
     report.extend(set_chrome_restore_on_startup(dry_run=dry_run))
+    report.extend(warp_report())
 
     local_bin = os.path.expanduser("~/.local/bin")
     if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
