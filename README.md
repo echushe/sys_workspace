@@ -57,10 +57,12 @@ seconds from login to overwrite -- so by the time you run `restore`, the
 session you wanted has already been replaced by the blank slate you were
 about to restore into. Nothing was broken: there really was one terminal
 with one tab. The only thing wrong was *which session* the snapshot
-described. Saves are now keyed to the kernel's boot id and will not
-overwrite a recorded session from an earlier boot until it has actually been
-restored -- or until you run `sessionctl adopt`, which says "keep what's on
-screen" explicitly.
+described. Snapshots are now keyed to the kernel's boot id, and the last
+snapshot of each boot is copied to `previous_boot.json` the moment the new
+boot's first save would replace it; `restore` replays that copy. (The first
+fix for this paused saving until you restored, and that pause never expired
+-- one reboot without a restore stopped saving for 26 days. See the last
+finding under Tests.)
 
 **The seventh finding overturned a documented impossibility rather than
 fixing a fault.** Three windows of 5, 6 and 7 tabs came back as three windows
@@ -217,14 +219,14 @@ true, and a prompt that cannot be answered would surface as an ordinary
 
 ./sessionctl save            # snapshot terminal tabs, but only if changed
 ./sessionctl save --dry-run  # print what would be saved, store nothing
-./sessionctl adopt --yes     # after a reboot: keep the current desktop instead of
-                             #   restoring, and let saves resume (see Status)
-./sessionctl list            # list stored snapshots, newest first
-./sessionctl show [id]       # show a snapshot (default: latest)
+./sessionctl list            # list stored snapshots, newest first, and what
+                             #   `restore` would replay
+./sessionctl show [id]       # show a snapshot (default: latest;
+                             #   `previous` = the one from before the last reboot)
 
 ./sessionctl restore --dry-run              # print the exact commands, launch nothing
-./sessionctl restore                        # actually relaunch terminals/VSCode/Chrome
-./sessionctl restore --snapshot ID          # restore a specific snapshot, not latest
+./sessionctl restore                        # relaunch the session from before the last reboot
+./sessionctl restore --snapshot ID          # restore a specific snapshot (or `latest`)
 ./sessionctl restore --only vscode,chrome   # restore a subset
                              #   (terminals, warp, vscode, chrome, layout)
 ./sessionctl restore --warp-force           # launch Warp even if it's running
@@ -232,7 +234,7 @@ true, and a prompt that cannot be answered would surface as an ordinary
 ./sessionctl restore --skip-mounts          # skip Stage 0 (you've already mounted)
 
 ./sessionctl place                          # re-apply layout from latest, launch nothing new
-./sessionctl place --snapshot ID            # use a specific snapshot
+./sessionctl place --snapshot ID            # use a specific snapshot (or `previous`)
 ./sessionctl place --timeout 30             # wait longer for windows to appear
 ./sessionctl place --static-workspaces      # use raw indices (only if you've set
                                              # dynamic-workspaces=false yourself)
@@ -577,7 +579,7 @@ a machine whose rules require it — see the note under "Scanning `$HOME`".
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-316 tests. Mount branches are stubbed rather than run against real hardware --
+326 tests. Mount branches are stubbed rather than run against real hardware --
 see the section above. Terminal capture, VSCode and Chrome were all exercised
 against real state (a real gnome-terminal tab via `--rcfile`, matching how
 `restore` invokes shells; the real `storage.json`; the real Chrome session
@@ -803,17 +805,10 @@ wrong.
 Fixed with the one signal that distinguishes the two sessions: the kernel's
 boot id (`/proc/sys/kernel/random/boot_id`), recorded in every snapshot. If
 `latest.json` carries a different boot id than the running boot, it describes
-a session from before the reboot, and `save` will not overwrite it until
-either `restore` has replayed it (which marks the boot as restored) or
-`sessionctl adopt --yes` declares the current desktop the session of record.
-Snapshots predating this field are never blocked, so upgrading can't freeze
-saving. Because a paused save is otherwise invisible -- the refusal goes to
-the timer's journal, not a terminal -- `sessionctl list` says so explicitly.
-
-Verified end to end against a synthetic previous-boot snapshot in a throwaway
-state dir: `save` refuses and leaves the 5-tab `latest.json` byte-identical,
-`list` reports the pause, `adopt` without `--yes` refuses with exit 1, and
-`adopt --yes` unblocks saving.
+a session from before the reboot. The first version of this fix made `save`
+refuse to overwrite it until `restore` or `sessionctl adopt --yes` had run.
+That turned out to be its own failure, and it has been replaced: see the last
+finding below.
 
 **A seventh finding, and the first that overturned a "not possible" rather
 than fixing a fault.** Three terminal windows holding 5, 6 and 7 tabs came
@@ -1232,6 +1227,71 @@ bugs, each of which only exists across a real login boundary no test harness
 simulates, and the package-deployment bug, found by running `sessionctl
 mount` directly against a real (if artificially unmounted) disk rather than
 through any reboot at all.
+
+**The boot guard from the sixth failure then lost 26 days of session.**
+The symptom was the familiar one: after a reboot on 2026-10-11, `restore`
+brought back one terminal tab instead of the session from before the
+reboot. The snapshot it replayed was from 2026-09-15, three boots earlier.
+The save timer's journal shows why:
+
+| Period | `save` outcome |
+|---|---|
+| 2026-09-15 07:18 -- 07:31 | saving normally; last snapshot 07:31 (1 tab) |
+| 2026-09-15 07:35 -- 2026-10-11 10:55 | **refused 72,777 times**: "latest.json holds a session from a previous boot ... that hasn't been restored yet" |
+| 2026-10-11 10:55 | `restore` replays the 07:31 snapshot; saving resumes |
+
+The guard did exactly what it was written to do. `save` would not overwrite a
+previous boot's session until `restore` or `adopt` had run, and after the
+Sep 15 07:34 reboot neither did. Nothing ever released it. It held through
+the Sep 15 10:50 and Sep 27 21:05 reboots too, because each new boot was
+also "not restored", and it kept protecting the *oldest* session rather
+than the one just left. Everything open from Sep 27 to Oct 11 was never
+captured. The hook's state files for those shells were deleted by their
+EXIT traps at shutdown and by the first unrefused save's prune, so it is
+not recoverable. The only signals were the timer's journal and a NOTE in
+`sessionctl list`, the same kind of silence the 25-hour `save` crash above
+hid in. The restore-time staleness warning did fire (26 days), but only as
+a warning after the fact. It also fired after any shutdown longer than an
+hour, which is a good way to teach yourself to ignore it.
+
+The fix keeps the guard's purpose and drops the pause. `save` always
+proceeds. The first time a new boot's snapshot would replace `latest.json`,
+`store()` copies the old one to `previous_boot.json`
+(`snapshot._pin_previous_boot`). `restore` with no `--snapshot` replays
+`snapshot.restore_target()`. That is `latest.json` while nothing has been
+stored under this boot yet (e.g. the disk is still unmounted and saves refuse
+as degraded), and the pinned copy afterwards. So the 47-second race from the
+sixth failure stays closed, and rebooting any number of times without
+restoring never falls more than one boot behind. `adopt` and `save --force`
+existed only to release the guard, and are gone. `restore`, `list` and
+`place --snapshot previous` say which snapshot they mean.
+
+The staleness warning is now boot-aware, so it fires for the two real
+failures and stays quiet otherwise:
+
+- **From the boot that just ended:** it compares when saving last confirmed
+  the snapshot (`snapshot.last_verified`) against when that boot's journal
+  stops (`cli.previous_boot()`, the last entry of `journalctl -b -1`). A gap
+  over an hour means saving died before shutdown. How long the machine was
+  then off is irrelevant.
+- **From an older boot:** it warns that nothing was saved during the boot
+  that just ended. That is exactly the Oct 11 case. Run against a copy of
+  the Sep 15 snapshot, it says "is from an older boot, not the one that
+  ended 2026-10-11T10:29:20".
+- **From this boot:** the old one-hour rule, measured from `last_verified`
+  rather than `ts`. An idle desktop no longer looks stale just because it
+  hasn't changed.
+
+`last_verified` comes from the heartbeat, which now records its boot id.
+The first heartbeat of a new boot moves the old one under `previous`, so the
+pre-reboot session's last confirmation survives the reboot.
+
+Verified end to end against throwaway state dirs and the real desktop:
+`save` writes immediately where it used to refuse, pins the Sep 15 snapshot,
+and `restore --dry-run` keeps targeting it; `--snapshot latest` replays this
+boot's two tabs. A previous-boot snapshot confirmed 15s before shutdown
+restores with no warning, even though its `ts` is 12 hours older; the same
+snapshot last confirmed 4.5 hours before shutdown warns.
 
 ## Note on `python3`
 

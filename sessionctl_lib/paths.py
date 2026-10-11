@@ -27,12 +27,11 @@ LATEST_FILE = os.path.join(STATE_DIR, "latest.json")
 # without rewriting a whole snapshot. See "Write avoidance" in the plan.
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 
-# Holds the boot id under which the recorded session was last restored (or
-# explicitly adopted). Until it matches the running boot, `save` will not
-# overwrite latest.json -- a freshly booted desktop is not the session of
-# record, it's the blank slate you are about to restore into. See
-# snapshot.session_not_yet_restored.
-RESTORED_FILE = os.path.join(STATE_DIR, "restored_boot")
+# The last snapshot of the most recent earlier boot -- the session you had open
+# before rebooting. Copied aside the moment latest.json is first replaced by a
+# snapshot of the running boot, so saving never has to pause to protect it,
+# and the 20-entry ring can't evict it. See snapshot.restore_target.
+PREVIOUS_BOOT_FILE = os.path.join(STATE_DIR, "previous_boot.json")
 
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 

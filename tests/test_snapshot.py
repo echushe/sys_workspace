@@ -6,6 +6,7 @@ idle desktop must cost nothing. These tests are the ones that actually prove
 that -- everything else in this module is plumbing around them.
 """
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -236,6 +237,7 @@ class SaveTest(unittest.TestCase):
             SNAPSHOTS_DIR=os.path.join(self.tmp, "snapshots"),
             LATEST_FILE=os.path.join(self.tmp, "latest.json"),
             HEARTBEAT_FILE=os.path.join(self.tmp, "heartbeat.json"),
+            PREVIOUS_BOOT_FILE=os.path.join(self.tmp, "previous_boot.json"),
         )
         p.start()
         self.addCleanup(p.stop)
@@ -281,103 +283,183 @@ class SaveTest(unittest.TestCase):
         )
 
 
-class SessionNotYetRestoredTest(unittest.TestCase):
-    """The post-reboot race that lost a session twice.
+class _BootFixture(unittest.TestCase):
+    """A throwaway state dir, plus control over the boot id and clock."""
 
-    After a reboot the save timer captures the freshly booted desktop --
-    accurately -- and promotes it to latest.json before the user has run
-    `restore`. Measured at 47 seconds from login to overwrite: latest went
-    from 5 tabs (one of them in a project directory on torch209) to a single
-    `~` tab, and the restore that followed faithfully replayed that one tab.
+    T0 = "2026-10-01T10:00:00+08:00"
 
-    Neither other guard applies, because nothing is broken: the terminal
-    really exists, the layout really is visible. Only the boot id
-    distinguishes "the session I saved before rebooting" from "the desktop
-    that exists now".
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        p = mock.patch.multiple(
+            "sessionctl_lib.paths",
+            STATE_DIR=self.tmp,
+            SNAPSHOTS_DIR=os.path.join(self.tmp, "snapshots"),
+            LATEST_FILE=os.path.join(self.tmp, "latest.json"),
+            HEARTBEAT_FILE=os.path.join(self.tmp, "heartbeat.json"),
+            PREVIOUS_BOOT_FILE=os.path.join(self.tmp, "previous_boot.json"),
+        )
+        p.start()
+        self.addCleanup(p.stop)
+        os.makedirs(os.path.join(self.tmp, "snapshots"))
+
+    @contextlib.contextmanager
+    def at(self, boot, when=T0):
+        with mock.patch.object(snapshot.paths, "current_boot_id",
+                               return_value=boot), \
+             mock.patch.object(snapshot, "_now_iso", return_value=when):
+            yield
+
+    def save(self, boot, cwd, when=T0):
+        with self.at(boot, when):
+            return snapshot.save(make_snapshot(cwd=cwd))
+
+    @staticmethod
+    def cwd(snap):
+        return snap["terminals"]["windows"][0]["tabs"][0]["cwd"]
+
+    def target(self, boot):
+        with self.at(boot):
+            return snapshot.restore_target()
+
+
+class PreviousBootTest(_BootFixture):
+    """Keeping the session from before a reboot without ever pausing `save`.
+
+    Two failures bracket this. First: right after login the save timer
+    captured the freshly booted desktop -- accurately -- and promoted it to
+    latest.json 47 seconds in. The 5-tab session was gone before `restore`
+    ran, and the restore replayed a single `~` tab.
+
+    The fix for that refused to save at all until `restore` or `adopt` had
+    run, and that caused the second failure. One reboot without a restore
+    stopped saving on 2026-09-15. It stayed stopped through two more reboots,
+    72,777 refusals in all. On 2026-10-11, `restore` replayed a 26-day-old
+    one-tab session, and everything open since Sep 27 was lost.
+
+    Now saving always proceeds, and the pre-reboot session is copied aside
+    the moment latest.json would first be replaced by the new boot's.
     """
 
-    OLD, NEW = "boot-old", "boot-new"
+    def test_saving_never_pauses_after_a_reboot(self):
+        self.save("A", "/work")
+        changed, _, _ = self.save("B", "/home")
+        self.assertTrue(changed)
+        self.assertEqual(self.cwd(snapshot.load_latest()), "/home")
 
-    def prev(self, boot_id=OLD):
-        return {"boot_id": boot_id, "terminals": {"windows": []}}
+    def test_first_store_of_a_new_boot_pins_the_previous_session(self):
+        self.save("A", "/a")
+        self.save("A", "/b")
+        self.save("B", "/home")
+        pinned = snapshot.load_previous_boot()
+        self.assertEqual(self.cwd(pinned), "/b")
+        self.assertEqual(pinned["boot_id"], "A")
 
-    def test_previous_boot_and_not_restored_is_blocked(self):
-        self.assertTrue(snapshot.session_not_yet_restored(
-            self.prev(), self.NEW, restored_boot=None))
+    def test_later_stores_in_the_same_boot_do_not_repin(self):
+        self.save("A", "/a")
+        self.save("B", "/x")
+        self.save("B", "/y")
+        self.assertEqual(self.cwd(snapshot.load_previous_boot()), "/a")
 
-    def test_same_boot_is_never_blocked(self):
-        """Ordinary saves during a session must be unaffected."""
-        self.assertFalse(snapshot.session_not_yet_restored(
-            self.prev(self.NEW), self.NEW, restored_boot=None))
+    def test_restore_target_after_reboot_is_the_pre_reboot_session(self):
+        """The 47-second race: the new desktop is latest, restore ignores it."""
+        self.save("A", "/work")
+        self.save("B", "/home")
+        self.assertEqual(self.cwd(self.target("B")), "/work")
 
-    def test_restored_this_boot_unblocks(self):
-        self.assertFalse(snapshot.session_not_yet_restored(
-            self.prev(), self.NEW, restored_boot=self.NEW))
+    def test_restore_target_before_anything_is_stored_is_latest(self):
+        """E.g. data disk not mounted yet, so every save refuses as degraded."""
+        self.save("A", "/work")
+        self.assertEqual(self.cwd(self.target("B")), "/work")
 
-    def test_marker_from_an_older_boot_does_not_unblock(self):
-        """A stale marker left by the previous boot must not count as having
-        restored under this one.
+    def test_latest_wins_over_an_older_pin(self):
+        """A boot in which nothing was stored leaves latest.json newer than the
+        pin. The pin is from two boots back and must not be chosen.
         """
-        self.assertTrue(snapshot.session_not_yet_restored(
-            self.prev(), self.NEW, restored_boot=self.OLD))
+        self.save("A", "/a")
+        self.save("B", "/b")       # pins A
+        self.assertEqual(self.cwd(self.target("C")), "/b")
 
-    def test_previous_without_boot_id_is_not_blocked(self):
-        """Snapshots written before this mechanism existed can't be reasoned
-        about, and must not freeze saving after an upgrade.
+    def test_repeated_reboots_without_restore_never_fall_behind(self):
+        """The 2026-10-11 failure: three reboots, no restore in between."""
+        self.save("A", "/a")
+        self.save("B", "/b")
+        self.save("C", "/c")
+        self.assertEqual(self.cwd(self.target("D")), "/c")
+        self.save("D", "/d")
+        self.assertEqual(self.cwd(self.target("D")), "/c")
+
+    def test_without_a_reboot_the_target_is_latest(self):
+        self.save("A", "/a")
+        self.save("A", "/b")
+        self.assertEqual(self.cwd(self.target("A")), "/b")
+
+    def test_unreadable_boot_id_falls_back_to_latest(self):
+        self.save("A", "/a")
+        self.save("B", "/b")
+        self.assertEqual(self.cwd(self.target(None)), "/b")
+
+    def test_snapshot_without_boot_id_is_never_pinned(self):
+        """Written before boot ids were recorded: nothing to reason about."""
+        legacy = make_snapshot(cwd="/old")
+        legacy.pop("boot_id")
+        legacy["digest"] = snapshot.digest(legacy)
+        snapshot._write_json(snapshot.paths.LATEST_FILE, legacy)
+        self.save("B", "/new")
+        self.assertIsNone(snapshot.load_previous_boot())
+        self.assertEqual(self.cwd(self.target("B")), "/new")
+
+    def test_boot_id_spellings_compare_equal(self):
+        """/proc's dashed UUID vs the journal's bare hex."""
+        self.assertTrue(snapshot._same_boot(
+            "296a354d-d969-4e5e-a0b3-60035e8c48a5",
+            "296a354dd9694e5ea0b360035e8c48a5"))
+        self.assertFalse(snapshot._same_boot("A", None))
+        self.assertFalse(snapshot._same_boot(None, None))
+
+
+class LastVerifiedTest(_BootFixture):
+    """A snapshot's ts is when the state last changed, not when it was last
+    seen. An idle desktop can stay unchanged for hours while saving is
+    healthy, so staleness has to be judged from the heartbeat.
+    """
+
+    T1 = "2026-10-01T18:00:00+08:00"
+    T2 = "2026-10-02T09:00:00+08:00"
+
+    def test_heartbeat_records_the_boot(self):
+        self.save("A", "/a")
+        self.assertEqual(snapshot.load_heartbeat()["boot_id"], "A")
+
+    def test_unchanged_saves_advance_last_verified_but_not_ts(self):
+        self.save("A", "/a", self.T0)
+        self.save("A", "/a", self.T1)
+        latest = snapshot.load_latest()
+        self.assertEqual(latest["ts"], self.T0)
+        self.assertEqual(snapshot.last_verified(latest), self.T1)
+
+    def test_previous_boots_last_heartbeat_survives_the_reboot(self):
+        self.save("A", "/a", self.T0)
+        self.save("A", "/a", self.T1)          # last sign of life in boot A
+        self.save("B", "/home", self.T2)
+        pinned = snapshot.load_previous_boot()
+        self.assertEqual(snapshot.last_verified(pinned), self.T1)
+
+    def test_unchanged_first_save_of_a_new_boot_keeps_it_too(self):
+        """Same desktop after reboot: latest.json isn't rewritten, but the
+        heartbeat is, and must not lose boot A's last confirmation.
         """
-        self.assertFalse(snapshot.session_not_yet_restored(
-            {"terminals": {"windows": []}}, self.NEW, restored_boot=None))
+        self.save("A", "/a", self.T0)
+        self.save("A", "/a", self.T1)
+        self.save("B", "/a", self.T2)
+        latest = snapshot.load_latest()
+        self.assertEqual(latest["boot_id"], "A")
+        self.assertEqual(snapshot.last_verified(latest), self.T1)
 
-    def test_unreadable_boot_id_is_not_blocked(self):
-        self.assertFalse(snapshot.session_not_yet_restored(
-            self.prev(), None, restored_boot=None))
-
-    def test_no_previous_snapshot_is_not_blocked(self):
-        self.assertFalse(snapshot.session_not_yet_restored(
-            None, self.NEW, restored_boot=None))
-
-
-class MarkRestoredTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        patcher = mock.patch.multiple(
-            snapshot.paths,
-            STATE_DIR=self.tmp.name,
-            CONFIG_DIR=os.path.join(self.tmp.name, "config"),
-            SHELLS_DIR=os.path.join(self.tmp.name, "shells"),
-            SNAPSHOTS_DIR=os.path.join(self.tmp.name, "snapshots"),
-            RESTORED_FILE=os.path.join(self.tmp.name, "restored_boot"),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_round_trip(self):
-        snapshot.mark_restored("boot-xyz")
-        self.assertEqual(snapshot.read_restored_boot(), "boot-xyz")
-
-    def test_absent_marker_reads_as_none(self):
-        self.assertIsNone(snapshot.read_restored_boot())
-
-    def test_marking_twice_overwrites(self):
-        snapshot.mark_restored("boot-1")
-        snapshot.mark_restored("boot-2")
-        self.assertEqual(snapshot.read_restored_boot(), "boot-2")
-
-    def test_unreadable_boot_id_writes_nothing(self):
-        """Passing None means "use the current boot"; the case that must
-        write nothing is the current boot id being unreadable.
-        """
-        with mock.patch.object(snapshot.paths, "current_boot_id",
-                               return_value=None):
-            self.assertIsNone(snapshot.mark_restored())
-        self.assertIsNone(snapshot.read_restored_boot())
-
-    def test_defaults_to_the_current_boot(self):
-        with mock.patch.object(snapshot.paths, "current_boot_id",
-                               return_value="boot-current"):
-            self.assertEqual(snapshot.mark_restored(), "boot-current")
-        self.assertEqual(snapshot.read_restored_boot(), "boot-current")
+    def test_falls_back_to_ts_without_a_heartbeat(self):
+        self.save("A", "/a", self.T0)
+        os.unlink(snapshot.paths.HEARTBEAT_FILE)
+        self.assertEqual(
+            snapshot.last_verified(snapshot.load_latest()), self.T0)
 
 
 class DesktopNotVisibleTest(unittest.TestCase):

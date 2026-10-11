@@ -210,50 +210,120 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
-class SnapshotAgeTest(unittest.TestCase):
+class StaleWarningTest(unittest.TestCase):
     """Restoring is the moment a stopped `save` becomes visible.
 
-    A TypeError in digest() killed every save for 25 hours and the failure
-    lived only in the timer's journal. The restore that followed replayed a
-    day-old session, and the windows coming back wrong was the first and
-    only symptom. The age of what is about to be replayed is cheap to state.
+    Twice a restore has replayed an old session, and the windows coming back
+    wrong were the first symptom. Once a TypeError in digest() killed every
+    save for 25 hours. Once the boot guard paused saving for 26 days, so the
+    restore on 2026-10-11 replayed a session saved on 2026-09-15, three boots
+    earlier.
+
+    The warning has to fire for those and stay quiet otherwise. A warning
+    that fires after every overnight shutdown teaches you to ignore it.
     """
+
+    NOW_BOOT = "296a354d-d969-4e5e-a0b3-60035e8c48a5"
+    PREV_BOOT = "33ae287f-5a68-4866-85bc-bdd35a4552f4"
+    OLD_BOOT = "cfd3a460-fe0e-4551-bbba-95a718ace3d1"
 
     def setUp(self):
         from sessionctl_lib import cli
         self.cli = cli
-        self.now = datetime.datetime(2026, 9, 16, 16, 0, 0).astimezone()
+        self.now = datetime.datetime(2026, 10, 11, 11, 0, 0).astimezone()
+        self.shutdown = datetime.datetime(2026, 10, 11, 10, 29, 20).astimezone()
 
-    def snap(self, minutes_ago):
-        taken = self.now - datetime.timedelta(minutes=minutes_ago)
-        return {"ts": taken.isoformat()}
+    def ago(self, base, **delta):
+        return (base - datetime.timedelta(**delta)).isoformat()
 
-    def test_fresh_snapshot_has_small_age(self):
-        self.assertLess(self.cli.snapshot_age(self.snap(1), self.now), 120)
+    def warn(self, snap, verified=None, prev_boot=None):
+        return self.cli.stale_warning(
+            snap, verified or snap.get("ts"), self.NOW_BOOT, prev_boot, self.now)
 
-    def test_day_old_snapshot_is_past_the_threshold(self):
-        age = self.cli.snapshot_age(self.snap(25 * 60), self.now)
-        self.assertGreater(age, self.cli.STALE_AFTER)
+    def test_fresh_snapshot_from_this_boot_is_quiet(self):
+        snap = {"ts": self.ago(self.now, minutes=1), "boot_id": self.NOW_BOOT}
+        self.assertIsNone(self.warn(snap))
 
-    def test_missing_timestamp_is_not_an_error(self):
-        self.assertIsNone(self.cli.snapshot_age({}, self.now))
-        self.assertIsNone(self.cli.snapshot_age(None, self.now))
+    def test_this_boot_with_saving_stopped_warns(self):
+        snap = {"ts": self.ago(self.now, hours=25), "boot_id": self.NOW_BOOT}
+        lines = self.warn(snap)
+        self.assertIn("not been running", "\n".join(lines))
 
-    def test_unparseable_timestamp_is_not_an_error(self):
-        self.assertIsNone(self.cli.snapshot_age({"ts": "not a date"}, self.now))
+    def test_idle_desktop_is_judged_by_heartbeat_not_ts(self):
+        """Unchanged for 5 hours, confirmed 20 seconds ago: healthy."""
+        snap = {"ts": self.ago(self.now, hours=5), "boot_id": self.NOW_BOOT}
+        self.assertIsNone(self.warn(snap, self.ago(self.now, seconds=20)))
+
+    def test_previous_boot_snapshot_is_not_judged_by_wall_clock(self):
+        """Machine off for three days: the session is still the right one."""
+        snap = {"ts": self.ago(self.shutdown, hours=9), "boot_id": self.PREV_BOOT}
+        verified = self.ago(self.shutdown, seconds=25)
+        now = self.shutdown + datetime.timedelta(days=3)
+        prev = (self.PREV_BOOT.replace("-", ""), self.shutdown)
+        self.assertIsNone(self.cli.stale_warning(
+            snap, verified, self.NOW_BOOT, prev, now))
+
+    def test_saving_stopped_before_last_shutdown_warns(self):
+        snap = {"ts": self.ago(self.shutdown, hours=5), "boot_id": self.PREV_BOOT}
+        verified = self.ago(self.shutdown, hours=3)
+        lines = self.warn(snap, verified, (self.PREV_BOOT, self.shutdown))
+        self.assertIn("saving stopped 3.0 hours before the last shutdown",
+                      "\n".join(lines))
+
+    def test_snapshot_from_an_older_boot_warns(self):
+        """2026-10-11: the boot that just ended had no snapshot at all."""
+        snap = {"ts": "2026-09-15T07:31:26+08:00", "boot_id": self.OLD_BOOT}
+        lines = self.warn(snap, prev_boot=("33ae287f5a68486685bcbdd35a4552f4",
+                                           self.shutdown))
+        self.assertIn("older boot", "\n".join(lines))
+
+    def test_unknown_previous_boot_stays_quiet(self):
+        """No journal access: nothing to compare against, so no guessing."""
+        snap = {"ts": self.ago(self.now, days=3), "boot_id": self.PREV_BOOT}
+        self.assertIsNone(self.warn(snap, prev_boot=None))
+
+    def test_snapshot_without_boot_id_uses_wall_clock(self):
+        self.assertIsNotNone(self.warn({"ts": self.ago(self.now, hours=25)}))
+        self.assertIsNone(self.warn({"ts": self.ago(self.now, minutes=5)}))
+
+    def test_unparseable_timestamps_are_not_an_error(self):
+        self.assertIsNone(self.warn({"ts": "not a date"}))
+        self.assertIsNone(self.warn({}))
 
     def test_age_formatting_picks_sensible_units(self):
         self.assertIn("minutes", self.cli._format_age(300))
         self.assertIn("hours", self.cli._format_age(7200))
         self.assertIn("days", self.cli._format_age(200000))
 
-    def test_warning_only_fires_when_stale(self):
-        import io, contextlib
-        for minutes, expect in ((1, False), (25 * 60, True)):
-            buf = io.StringIO()
-            snap = self.snap(minutes)
-            with contextlib.redirect_stderr(buf), \
-                 mock.patch.object(self.cli, "snapshot_age",
-                                   return_value=minutes * 60):
-                self.cli._warn_if_stale(snap)
-            self.assertEqual("warning" in buf.getvalue(), expect)
+
+class PreviousBootLookupTest(unittest.TestCase):
+    """cli.previous_boot(): the journal's record of the boot that just ended."""
+
+    def setUp(self):
+        from sessionctl_lib import cli
+        self.cli = cli
+
+    def run_with(self, **kwargs):
+        import subprocess
+        result = subprocess.CompletedProcess([], kwargs.pop("returncode", 0),
+                                             kwargs.pop("stdout", ""), "")
+        side_effect = kwargs.pop("side_effect", None)
+        with mock.patch.object(self.cli.subprocess, "run",
+                               return_value=result, side_effect=side_effect):
+            return self.cli.previous_boot()
+
+    def test_parses_boot_id_and_last_entry_time(self):
+        # Verbatim from this machine: the last entry of the boot before.
+        line = ('{"__CURSOR":"s=3eec","__MONOTONIC_TIMESTAMP":"1171466349498",'
+                '"_BOOT_ID":"33ae287f5a68486685bcbdd35a4552f4",'
+                '"__REALTIME_TIMESTAMP":"1791685760697869"}\n')
+        boot_id, ended = self.run_with(stdout=line)
+        self.assertEqual(boot_id, "33ae287f5a68486685bcbdd35a4552f4")
+        self.assertEqual(int(ended.timestamp()), 1791685760)
+
+    def test_failure_modes_return_none(self):
+        self.assertIsNone(self.run_with(returncode=1, stdout=""))
+        self.assertIsNone(self.run_with(stdout=""))
+        self.assertIsNone(self.run_with(stdout="not json\n"))
+        self.assertIsNone(self.run_with(stdout='{"_BOOT_ID":"x"}\n'))
+        self.assertIsNone(self.run_with(side_effect=FileNotFoundError()))

@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import shlex
+import subprocess
 import sys
 
 from . import (collect, config, layout, mounts, paths, restore, setup,
@@ -117,34 +118,11 @@ def cmd_save(args):
     # file whose mtime and size have not changed since the last snapshot.
     previous = snapshot.load_latest() or {}
 
-    # The recorded session belongs to an earlier boot and hasn't been restored
-    # yet, so latest.json is the thing you are about to restore *from*.
-    # Overwriting it with the freshly booted desktop -- which is exactly what
-    # the timer would otherwise do within 30s of you mounting the disk -- is
-    # how a real session gets lost. Unlike the two refusals above, nothing
-    # here is malfunctioning; the capture is accurate, it just describes the
-    # wrong session.
-    boot_id = paths.current_boot_id()
-    restored_boot = snapshot.read_restored_boot()
-    if not args.force and snapshot.session_not_yet_restored(
-        previous or None, boot_id, restored_boot
-    ):
-        prev_tabs = sum(
-            len(w["tabs"]) for w in previous.get("terminals", {}).get("windows", [])
-        )
-        print(
-            f"latest.json holds a session from a previous boot ({prev_tabs} "
-            f"tabs, saved {previous.get('ts')}) that hasn't been restored yet.",
-            file=sys.stderr,
-        )
-        print(
-            "Not overwriting it with the current desktop. Run `sessionctl "
-            "restore` to bring that session back, or `sessionctl adopt` to "
-            "keep the desktop as it is now and resume saving.",
-            file=sys.stderr,
-        )
-        return 0
-
+    # No refusal for "latest.json is from an earlier boot": saving the freshly
+    # booted desktop is correct, and the session from before the reboot is
+    # copied aside the moment it would be overwritten (snapshot.store ->
+    # _pin_previous_boot). An earlier version refused instead, and stopped
+    # saving for 26 days because nobody ran `restore` after one reboot.
     terminals = collect.collect_terminals(prune=not args.no_prune)
 
     # Same principle as the mount check above, one layer in: terminal windows
@@ -232,8 +210,13 @@ def cmd_save(args):
 
 
 def _load_snapshot(snapshot_id):
-    if snapshot_id in (None, "latest"):
+    """None: the restore target. "latest", "previous", or a snapshot id."""
+    if snapshot_id is None:
+        return snapshot.restore_target()
+    if snapshot_id == "latest":
         return snapshot.load_latest()
+    if snapshot_id == "previous":
+        return snapshot.load_previous_boot()
     path = os.path.join(paths.SNAPSHOTS_DIR, snapshot_id + ".json")
     try:
         with open(path) as f:
@@ -242,22 +225,34 @@ def _load_snapshot(snapshot_id):
         return None
 
 
+def _describe(snap):
+    """One line naming a snapshot: when, which boot, and how many tabs."""
+    tabs = sum(
+        len(w.get("tabs", []))
+        for w in snap.get("terminals", {}).get("windows", [])
+    )
+    boot_id = snap.get("boot_id")
+    if not boot_id:
+        which = "boot unknown"
+    elif snapshot._same_boot(boot_id, paths.current_boot_id()):
+        which = "this boot"
+    else:
+        which = "earlier boot"
+    return f"saved {snap.get('ts')} ({which}), {tabs} terminal tabs"
+
+
 STALE_AFTER = 3600  # seconds; a snapshot older than this is worth mentioning
 
 
-def snapshot_age(snap, now=None):
-    """Seconds between a snapshot's timestamp and now, or None if unreadable."""
-    ts = (snap or {}).get("ts")
+def _parse_ts(ts):
+    """An ISO timestamp as an aware datetime, or None if unreadable."""
     if not ts:
         return None
     try:
-        taken = datetime.datetime.fromisoformat(ts)
+        t = datetime.datetime.fromisoformat(ts)
     except (TypeError, ValueError):
         return None
-    now = now or datetime.datetime.now().astimezone()
-    if taken.tzinfo is None:
-        taken = taken.astimezone()
-    return (now - taken).total_seconds()
+    return t if t.tzinfo else t.astimezone()
 
 
 def _format_age(seconds):
@@ -268,32 +263,105 @@ def _format_age(seconds):
     return f"{seconds / 60:.0f} minutes"
 
 
-def _warn_if_stale(snap):
-    """Say so when the snapshot about to be replayed is not recent.
+def previous_boot():
+    """(boot_id, ended) for the boot before this one, or None.
 
-    `save` runs every 30s, so a snapshot more than an hour old means saving
-    stopped -- and the only thing that makes that visible is the moment you
-    restore from it. It has happened: a TypeError in digest() killed every
-    save for 25 hours, and the failure lived in the timer's journal where
-    nobody was looking. The restore then replayed a day-old session and the
-    windows came back wrong, which is a confusing way to learn that saving
-    had stopped the day before.
+    Read from the journal: the last entry of boot -1 carries both its boot id
+    and, to the second, when that boot stopped logging -- i.e. shutdown. Best
+    effort: a volatile journal, no read access, or no journalctl at all just
+    means the staleness check has less to go on.
     """
-    age = snapshot_age(snap)
-    if age is None or age < STALE_AFTER:
-        return
-    print(
-        f"warning: this snapshot is {_format_age(age)} old (taken "
-        f"{snap.get('ts')}).",
-        file=sys.stderr,
+    try:
+        out = subprocess.run(
+            ["journalctl", "-b", "-1", "-n", "1", "-o", "json",
+             "--output-fields=_BOOT_ID", "--no-pager", "-q"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        rec = json.loads(out.stdout.strip().splitlines()[-1])
+        boot_id = rec["_BOOT_ID"]
+        usec = int(rec["__REALTIME_TIMESTAMP"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    ended = datetime.datetime.fromtimestamp(usec / 1e6).astimezone()
+    return boot_id, ended
+
+
+def stale_warning(snap, verified, boot_id, prev_boot, now=None):
+    """Lines warning that `snap` is not the session it should be, or None.
+
+    Restoring is the one moment a stopped `save` becomes visible: twice now a
+    restore has replayed an old session, and the windows coming back wrong
+    was the first symptom. Once a TypeError killed every save for 25 hours.
+    Once the boot guard paused saving for 26 days.
+
+    What "too old" means depends on whose session it is. For one from this
+    boot, an hour since saving last confirmed it is too long. For one from
+    before a reboot, wall-clock age mostly measures how long the machine was
+    off. What matters there is whether it came from the boot that just ended,
+    and whether saving was still running when that boot shut down.
+    `verified` is snapshot.last_verified(snap); `prev_boot` is
+    previous_boot().
+    """
+    ts = snap.get("ts")
+    hint = ("         Check `journalctl --user -u sessionctl-save.service` "
+            "and `sessionctl list`.")
+    verified_at = _parse_ts(verified) or _parse_ts(ts)
+    if verified_at is None:
+        return None
+    snap_boot = snap.get("boot_id")
+
+    if snap_boot and boot_id and not snapshot._same_boot(snap_boot, boot_id):
+        if prev_boot is None:
+            return None
+        prev_id, ended = prev_boot
+        if not snapshot._same_boot(snap_boot, prev_id):
+            return [
+                f"warning: this snapshot (saved {ts}) is from an older boot, "
+                f"not the one that ended {ended.isoformat(timespec='seconds')}.",
+                "         Nothing was saved during that boot, so whatever you "
+                "had open then is not in it.",
+                hint,
+            ]
+        gap = (ended - verified_at).total_seconds()
+        if gap < STALE_AFTER:
+            return None
+        return [
+            f"warning: saving stopped {_format_age(gap)} before the last "
+            f"shutdown (last confirmed {verified}, shut down "
+            f"{ended.isoformat(timespec='seconds')}).",
+            "         Anything opened after that is not in this snapshot.",
+            hint,
+        ]
+
+    now = now or datetime.datetime.now().astimezone()
+    age = (now - verified_at).total_seconds()
+    if age < STALE_AFTER:
+        return None
+    return [
+        f"warning: this snapshot was last confirmed {_format_age(age)} ago "
+        f"({verified}).",
+        "         Saving runs every 30s, so it has not been running since then.",
+        hint,
+    ]
+
+
+def _warn_if_stale(snap):
+    boot_id = paths.current_boot_id()
+    snap_boot = snap.get("boot_id")
+    earlier = snap_boot and boot_id and not snapshot._same_boot(snap_boot, boot_id)
+    lines = stale_warning(
+        snap,
+        snapshot.last_verified(snap),
+        boot_id,
+        previous_boot() if earlier else None,
     )
-    print(
-        "         Saving runs every 30s, so it has not been running since "
-        "then.\n"
-        "         Check `journalctl --user -u sessionctl-save.service -n 20` "
-        "and `sessionctl list`.",
-        file=sys.stderr,
-    )
+    for line in lines or ():
+        print(line, file=sys.stderr)
 
 
 def cmd_restore(args):
@@ -329,6 +397,7 @@ def cmd_restore(args):
         print(f"no such snapshot: {target}", file=sys.stderr)
         return 1
 
+    print(f"[snapshot] {_describe(snap)}", flush=True)
     _warn_if_stale(snap)
 
     plan = []
@@ -403,47 +472,6 @@ def cmd_restore(args):
                 print(
                     f"[layout] placed {len(result['placed'])} of {len(windows)} windows"
                 )
-
-    # The recorded session is now live under this boot, so the periodic save
-    # may resume updating latest.json. Until this point it deliberately
-    # refuses -- see cmd_save and snapshot.session_not_yet_restored.
-    if not args.dry_run:
-        marked = snapshot.mark_restored()
-        if marked:
-            print("[save] periodic snapshots resumed for this boot")
-    return 0
-
-
-def cmd_adopt(args):
-    """Claim the current desktop as the session of record.
-
-    The escape hatch for the boot guard: if you rebooted and would rather
-    keep working with what's on screen than restore the saved session, this
-    tells `save` to stop protecting the old one. It is the only way out of
-    the guard that doesn't involve restoring, so it's a real command rather
-    than a flag buried in `save`.
-    """
-    previous = snapshot.load_latest()
-    boot_id = paths.current_boot_id()
-    if boot_id is None:
-        print("cannot read this boot's id, nothing to adopt", file=sys.stderr)
-        return 1
-    if previous is not None and not args.yes:
-        prev_tabs = sum(
-            len(w["tabs"]) for w in previous.get("terminals", {}).get("windows", [])
-        )
-        print(
-            f"latest.json holds {prev_tabs} tabs saved {previous.get('ts')}.\n"
-            "Adopting means the next save overwrites it with the current "
-            "desktop, and that session is then only reachable via "
-            "`sessionctl list` / `restore --snapshot ID`.\n"
-            "Re-run with --yes to confirm.",
-            file=sys.stderr,
-        )
-        return 1
-    snapshot.mark_restored(boot_id)
-    print(f"adopted the current desktop for boot {boot_id}")
-    print("periodic snapshots will resume updating latest.json")
     return 0
 
 
@@ -452,8 +480,10 @@ def cmd_place(args):
 
     Does not launch anything -- for testing the layout pass on its own, or
     for putting an already-open desktop back where a snapshot recorded it.
+    Defaults to latest, unlike `restore`: this is for a layout you disturbed
+    a moment ago, not for one from before a reboot (`--snapshot previous`).
     """
-    snap = _load_snapshot(args.snapshot)
+    snap = _load_snapshot(args.snapshot or "latest")
     if snap is None:
         target = args.snapshot or "latest"
         print(f"no such snapshot: {target}", file=sys.stderr)
@@ -507,17 +537,11 @@ def cmd_list(args):
             f"{win_count:>2} windows"
         )
 
-    # A paused save is otherwise invisible -- the refusal goes to the timer's
-    # journal, not to a terminal -- and "my snapshots stopped updating" is
-    # exactly the kind of silence this tool has been bitten by before.
-    if snapshot.session_not_yet_restored(
-        latest, paths.current_boot_id(), snapshot.read_restored_boot()
-    ):
-        print()
-        print("NOTE: latest.json is from a previous boot and hasn't been "
-              "restored, so periodic saves are not updating it.")
-        print("      `sessionctl restore` to bring it back, or "
-              "`sessionctl adopt --yes` to keep the current desktop.")
+    # The restore target is often not in the ring above -- it's the pinned
+    # copy from before the reboot -- so say what `restore` would replay.
+    target = snapshot.restore_target()
+    if target is not None:
+        print(f"\nrestore target: {_describe(target)}")
 
     hb = snapshot.load_heartbeat()
     if hb:
@@ -526,19 +550,10 @@ def cmd_list(args):
 
 
 def cmd_show(args):
-    if args.id in (None, "latest"):
-        snap = snapshot.load_latest()
-        if snap is None:
-            print("no snapshots yet", file=sys.stderr)
-            return 1
-    else:
-        path = os.path.join(paths.SNAPSHOTS_DIR, args.id + ".json")
-        try:
-            with open(path) as f:
-                snap = json.load(f)
-        except (OSError, ValueError):
-            print(f"no such snapshot: {args.id}", file=sys.stderr)
-            return 1
+    snap = _load_snapshot(args.id or "latest")
+    if snap is None:
+        print(f"no such snapshot: {args.id or 'latest'}", file=sys.stderr)
+        return 1
 
     if args.json:
         print(json.dumps(snap, indent=2, ensure_ascii=False))
@@ -668,19 +683,7 @@ def build_parser():
         action="store_true",
         help="keep state files of tabs that have exited",
     )
-    s.add_argument(
-        "--force", action="store_true",
-        help="save even if the recorded session is from an unrestored boot "
-             "(prefer `sessionctl adopt`, which says so explicitly)",
-    )
     s.set_defaults(func=cmd_save)
-
-    ad = sub.add_parser(
-        "adopt",
-        help="keep the current desktop instead of restoring the saved session",
-    )
-    ad.add_argument("--yes", action="store_true", help="skip the confirmation")
-    ad.set_defaults(func=cmd_adopt)
 
     r = sub.add_parser("restore", help="replay a snapshot")
     r.add_argument(
@@ -689,7 +692,8 @@ def build_parser():
     )
     r.add_argument(
         "--snapshot", metavar="ID", default=None,
-        help="restore this snapshot instead of the latest",
+        help="a snapshot id, 'latest', or 'previous' (default: the session "
+             "from before the last reboot)",
     )
     r.add_argument(
         "--only", metavar="KINDS", default=None,
@@ -717,7 +721,8 @@ def build_parser():
     )
     pl.add_argument(
         "--snapshot", metavar="ID", default=None,
-        help="use this snapshot instead of the latest",
+        help="a snapshot id, or 'previous' for the session from before the "
+             "last reboot (default: latest)",
     )
     pl.add_argument(
         "--timeout", type=float, default=layout.DEFAULT_TIMEOUT,
@@ -734,7 +739,8 @@ def build_parser():
     ls.set_defaults(func=cmd_list)
 
     sh = sub.add_parser("show", help="show a snapshot (default: latest)")
-    sh.add_argument("id", nargs="?", help="snapshot id, or 'latest'")
+    sh.add_argument("id", nargs="?",
+                    help="snapshot id, 'latest', or 'previous' (before the last reboot)")
     sh.add_argument("--json", action="store_true", help="print raw JSON")
     sh.set_defaults(func=cmd_show)
 

@@ -270,14 +270,14 @@ timer captures the freshly booted desktop *accurately* and promotes it to `lates
 — measured at 47 seconds from login — so the session you meant to restore is gone
 before you type `sessionctl restore`. Neither guard above applies: the capture is
 correct, the desktop is visible, and only the *identity* of the session is wrong. Every
-snapshot therefore records the kernel's boot id (`/proc/sys/kernel/random/boot_id`), and
-`save` refuses to overwrite a `latest.json` belonging to an earlier boot until that
-session has been restored (which marks the boot) or explicitly abandoned via
-`sessionctl adopt`. Snapshots written before this field existed are never blocked, so
-upgrading cannot freeze saving. Note this interacts with Stage 0: while the disk is
-unmounted saves already refuse as degraded, so the exposure window opens the moment
-`sessionctl mount` succeeds and closes when `restore` runs — previously a 30-second race
-the user had to win by hand.
+snapshot therefore records the kernel's boot id (`/proc/sys/kernel/random/boot_id`).
+When the first snapshot of a new boot is about to replace a `latest.json` from an
+earlier boot, the old one is copied to `previous_boot.json`, and `restore` replays that
+copy by default (`latest.json` itself while nothing has been stored under this boot).
+This is deliberately *not* a refusal. The first version made `save` refuse until
+`restore` or `adopt` had run, and since nothing ever released it, a single reboot
+without a restore stopped saving for 26 days across three boots. Protect the session
+by copying it, never by stopping the save.
 
 **A second `save` guard, from the same failure mode one layer in.** An unmounted disk
 is not the only way to capture an empty session: the `~/.bashrc` hook can fail to load
@@ -458,13 +458,10 @@ re-run). Recommend doing it in the UI once — it's a single click and can't rac
 
 ### CLI surface
 
-`sessionctl save | restore | place | mount | adopt | list | show <id> | setup | uninstall`
+`sessionctl save | restore | place | mount | list | show <id> | setup | uninstall`
 
 `mount` runs Stage 0 alone. `restore --skip-mounts` bypasses it for the case where
 you have already mounted things yourself.
-
-`adopt` declares the currently-visible desktop to be the session of record after a
-reboot, releasing the boot guard described under Stage 0 without restoring anything.
 
 `place` re-applies only the workspace/geometry pass from a snapshot, without
 relaunching anything — useful for testing and for fixing a layout you disturbed.

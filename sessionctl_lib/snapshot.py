@@ -84,56 +84,96 @@ def desktop_not_visible(layout, previous):
     return False
 
 
-def read_restored_boot():
+def _same_boot(a, b):
+    """Compare boot ids across their two spellings.
+
+    /proc writes the boot id as a dashed UUID; the journal's _BOOT_ID is the
+    same 128 bits as bare hex. Both appear in this module's callers.
+    """
+    if not a or not b:
+        return False
+    return a.replace("-", "").lower() == b.replace("-", "").lower()
+
+
+def load_previous_boot():
     try:
-        with open(paths.RESTORED_FILE) as f:
-            return f.read().strip() or None
-    except OSError:
+        with open(paths.PREVIOUS_BOOT_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
         return None
 
 
-def mark_restored(boot_id=None):
-    """Record that the recorded session is live under this boot.
+def _pin_previous_boot(snap):
+    """Copy latest.json aside if `snap` is about to replace another boot's.
 
-    Written by `restore` once it has replayed a snapshot, and by `adopt` when
-    you want the current desktop to become the session of record without
-    restoring anything.
+    This is what keeps the session from before a reboot. Right after login,
+    the save timer captures the freshly booted desktop -- accurately -- and
+    promotes it to latest.json; measured once at 47 seconds. Without this
+    copy, the session you meant to restore is gone by the time you type
+    `restore`.
+
+    It replaces a guard that solved the same race by refusing to save at all
+    until `restore` or `adopt` had been run. That guard never expired: one
+    reboot without a restore stopped saving for 26 days, across two more
+    reboots, and the restore that finally ran replayed a session three boots
+    old. Pinning protects the same snapshot without ever stopping the save.
+
+    Only the first store of a new boot pins, because from then on latest.json
+    carries this boot's id. A snapshot with no boot id (unreadable /proc, or
+    written before boot ids were recorded) is never pinned.
+    """
+    previous = load_latest()
+    if previous is None:
+        return
+    old, new = previous.get("boot_id"), snap.get("boot_id")
+    if old and new and not _same_boot(old, new):
+        _write_json(paths.PREVIOUS_BOOT_FILE, previous)
+
+
+def restore_target(boot_id=None):
+    """The snapshot `restore` replays by default: the last one before reboot.
+
+    Until anything has been stored under this boot, that is latest.json
+    itself -- e.g. while the data disk is still unmounted and every save
+    refuses as degraded. After that it is the copy _pin_previous_boot took.
+    It falls back to latest.json when there is no earlier boot to speak of:
+    no reboot since install, or boot ids unavailable.
+
+    latest.json is checked first because it can be newer than the pin. A
+    boot in which nothing was ever stored leaves latest.json holding the boot
+    before it, while the pin is older still.
     """
     boot_id = boot_id or paths.current_boot_id()
-    if boot_id is None:
-        return None
-    paths.ensure_dirs()
-    with open(paths.RESTORED_FILE, "w") as f:
-        f.write(boot_id + "\n")
-    return boot_id
+    latest = load_latest()
+    if boot_id is None or latest is None:
+        return latest
+    latest_boot = latest.get("boot_id")
+    if latest_boot and not _same_boot(latest_boot, boot_id):
+        return latest
+    pinned = load_previous_boot()
+    pinned_boot = (pinned or {}).get("boot_id")
+    if pinned_boot and not _same_boot(pinned_boot, boot_id):
+        return pinned
+    return latest
 
 
-def session_not_yet_restored(previous, boot_id, restored_boot):
-    """True when latest.json belongs to an earlier boot we haven't restored.
+def last_verified(snap):
+    """When saving last confirmed `snap` was still the live state.
 
-    The failure this exists for: after a reboot, the save timer captures the
-    freshly booted desktop -- accurately -- and promotes it to latest.json
-    before you have had a chance to run `restore`. The session you actually
-    wanted is then gone from latest, and restoring replays the blank slate
-    instead. Measured once at 47 seconds from login to overwrite; at a 30s
-    tick you have to beat the timer to the keyboard, which is not a design.
-
-    Neither of the other two guards can catch this, because nothing is
-    malfunctioning: there really is one terminal with one tab, and the layout
-    really is visible. The only thing wrong is *which session* it describes,
-    and the boot id is what distinguishes them.
-
-    A previous snapshot with no boot_id predates this mechanism, so it can't
-    be reasoned about and must not block saving.
+    A snapshot's own ts is when the state last *changed*, not when it was
+    last seen. An idle desktop can stay unchanged for hours while saving runs
+    fine, so ts alone makes a healthy snapshot look stale. The heartbeat
+    keeps the real answer for this boot and the one before it.
     """
-    if previous is None or boot_id is None:
-        return False
-    prev_boot = previous.get("boot_id")
-    if not prev_boot:
-        return False
-    if prev_boot == boot_id:
-        return False
-    return restored_boot != boot_id
+    hb = load_heartbeat() or {}
+    for entry in (hb, hb.get("previous") or {}):
+        if (
+            entry.get("last_verified")
+            and entry.get("digest") == snap.get("digest")
+            and entry.get("boot_id") == snap.get("boot_id")
+        ):
+            return entry["last_verified"]
+    return snap.get("ts")
 
 
 def build(terminals, mounts_state, vscode=None, chrome=None, firefox=None,
@@ -275,9 +315,25 @@ def load_latest():
 
 
 def write_heartbeat(dig):
-    _write_json(
-        paths.HEARTBEAT_FILE, {"digest": dig, "last_verified": _now_iso()}
-    )
+    """Record that `dig` is still the live state, and keep the last boot's.
+
+    The previous boot's final heartbeat is the only record of how long saving
+    kept running before shutdown, which is what restore checks to say whether
+    the pre-reboot snapshot can be trusted (see last_verified). So the first
+    heartbeat of a new boot moves the old one under "previous" rather than
+    overwriting it.
+    """
+    boot_id = paths.current_boot_id()
+    hb = load_heartbeat() or {}
+    previous = hb.get("previous")
+    if hb.get("boot_id") and hb.get("boot_id") != boot_id:
+        previous = {k: hb.get(k) for k in ("boot_id", "digest", "last_verified")}
+    _write_json(paths.HEARTBEAT_FILE, {
+        "digest": dig,
+        "last_verified": _now_iso(),
+        "boot_id": boot_id,
+        "previous": previous,
+    })
 
 
 def load_heartbeat():
@@ -325,6 +381,7 @@ def store(snap):
     # sacrificing the readable timestamp prefix.
     snap_id = snap["ts"].replace(":", "-") + "_" + snap["digest"][7:15]
     _write_json(os.path.join(paths.SNAPSHOTS_DIR, snap_id + ".json"), snap)
+    _pin_previous_boot(snap)
     _write_json(paths.LATEST_FILE, snap)
     write_heartbeat(snap["digest"])
     prune()
