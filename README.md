@@ -5,6 +5,7 @@ with their conda envs, VSCode workspaces, browser tabs, and which GNOME
 workspace each window sat on.
 
 Design and rationale: [`docs/session_restore_plan.md`](docs/session_restore_plan.md).
+Record of the work done with Claude Code: [`docs/ai_history.md`](docs/ai_history.md).
 
 ## Status
 
