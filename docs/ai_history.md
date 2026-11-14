@@ -1,6 +1,6 @@
 # AI History
 
-Jobs done by Claude Code on sessionctl between 2026-08-24 and 2026-11-13, oldest first.
+Jobs done by Claude Code on sessionctl between 2026-08-24 and 2026-11-14, oldest first.
 Each entry covers one job, or one day of closely related jobs, in roughly 100–250 words.
 
 sessionctl did not start in this repository. From 2026-08-24 to 2026-09-21 it lived in
@@ -18,7 +18,8 @@ Sources:
 - the one such commit in this repository, `583e540`, by Claude Opus 5.5;
 - `stock_03_claude/docs/ai_history.md`, which drew on saved session logs and is the only
   source for the 2026-09-15 entry;
-- the log of the 2026-11-13 session that wrote this file.
+- the log of the session that wrote this file (`7e46bda2`, 2026-11-13 to 2026-11-14),
+  which is the source for every entry from 2026-11-13 on.
 
 No earlier Claude Code session logs for sessionctl are kept on this laptop, so the other
 entries are rebuilt from commit messages. Commits with neither a trailer nor a log are
@@ -217,6 +218,106 @@ the repo. `cli.py`, `paths.py` and `snapshot.py` differ, so the installed `sessi
 runs the boot guard that `583e540` removes, until `sessionctl setup` is run again. At the
 user's request, the file was committed the same day, together with a link from the
 README.
+
+## 2026-11-13 — Credential check of the whole repository
+
+*Claude Opus 5.5, same session.* The user set a rule: no login credentials (keys, tokens,
+passwords) in this repository. They asked for a check. No secret scanner was installed
+(gitleaks, trufflehog, detect-secrets), so the agent wrote one that matches known key and
+token formats and flags long random-looking strings. It scanned:
+
+- all 48 files on disk, including ignored ones;
+- all 44 distinct file versions in the 4 commits, on every branch and in the reflog;
+- every commit message;
+- `.git/config` and the hooks folder.
+
+There were no unreachable objects. Nothing matched a credential pattern. The only
+random-looking strings were paths that contain the data partition's UUID. 50 lines used
+words such as "login" or "password", and all were prose about login shells or PolicyKit
+prompts. The agent noted what is public without being a credential: the partition UUID,
+the username in paths, and commit author details. It also found that `master` had been
+fast-forwarded to `ff2922f` and pushed from VS Code at 16:07, outside the session. The
+rule was saved to this project's Claude memory.
+
+## 2026-11-13 — Commit hooks that block credentials
+
+Added `githooks/pre-commit` and `githooks/commit-msg`, which both run
+`githooks/credential_check.py`. The first scans the lines a commit adds and the names of
+files it adds, such as `id_ed25519`, `*.pem` and `.env`. The second scans the commit
+message. Matches are printed masked, so a real secret is not echoed. A reviewed line can
+carry an allow marker, and `--no-verify` skips both hooks.
+
+`tests/test_credential_check.py` adds 15 tests, and builds its samples from fragments so
+the file passes its own check. Removing one rule made three of those tests fail. One of
+the tests fails if any tracked file matches. Run over the whole history, the check found
+nothing. Its first version did flag the example credentials in its own comments, which
+were rewritten.
+
+In a throwaway clone, the hooks blocked a file holding a token, a file named `id_ed25519`
+and an AWS key in a commit message. They let through a line with the allow marker and the
+real change. They were turned on here with `git config core.hooksPath githooks`, and the
+README gained a "Commit hooks" section. 341 tests.
+
+Committed on 2026-11-14 as `e194e42` on a new branch, `credential-hooks-and-mosh-plan`. An
+empty commit with a fake token in its message was then refused, which showed the hooks run
+in this checkout.
+
+## 2026-11-13 — Can mosh + tmux tabs be restored?
+
+The user asked whether gnome-terminal or Warp tabs could be restored with mosh + tmux.
+11 of the 18 gnome-terminal tabs already ran `mosh <server> -- tmux new -A -s <name>`, for
+sessions `mnt_0`, `mnt_1`, `mnt_4` and `daily_0`–`daily_7`. `latest.json` recorded all 18
+tabs as `~` with env `base`, so a restore would have brought back local shells. The
+accessibility probe also read the server's prompt as the tab's own.
+
+- **Status bar.** tmux's status bar, read through the same probe, named each tab's session
+  exactly.
+- **Server.** A read-only look found 100 mosh-servers dating from Nov 2 to Nov 13, and
+  sessions with up to 7 clients attached. With `MOSH_SERVER_NETWORK_TMOUT` unset, every
+  laptop reboot had left its mosh-servers behind.
+- **Orphan test.** In a local test, killing a mosh client left its server running and
+  attached to tmux. Detaching that tmux client made the server exit within a second, and
+  the session survived.
+- **Warp.** Warp had no mosh, ssh or tmux use. Its own restore does not re-run commands,
+  and its tmux-based SSH mode has been removed. Whether its pane IDs survive a restart
+  could not be shown.
+
+Verdict: feasible for gnome-terminal, unproven for Warp, and not worthwhile with local
+tmux.
+
+One mistake: the agent's version check `mosh-server -V` started a real mosh-server on UDP
+60001 for about a minute and printed its session key into the session. The agent stopped
+it at once and told the user.
+
+## 2026-11-13 — The mosh + tmux restore plan
+
+Wrote [`mosh_tmux_restore_plan.md`](mosh_tmux_restore_plan.md). Several things were checked
+first, and each one shaped the design:
+
+- **Command line.** mosh passes the original command to `mosh-client` as one space-joined
+  `-# … |` argument, so quoting is lost and only a strict tmux new/attach shape is
+  replayed.
+- **History.** `history -s` while `~/.bashrc` runs lost the shell's loaded history, while
+  the same call at the first prompt landed last. So the command runs once, at the first
+  prompt.
+- **Shell.** Running it before the interactive shell starts would leave the tab without a
+  hook record, so it runs inside that shell.
+- **sshd.** The server uses the default `MaxStartups 10:30:100`, so reconnects are
+  staggered by one second per tab.
+- **Cleanup rule.** In `daily_0`, the newest tmux client was the live tab, so the
+  one-off cleanup keeps the newest client and detaches the rest.
+
+The plan:
+
+- records each tab's mosh command from `/proc`;
+- replays it with `-D` added, which clears the previous boot's orphaned server;
+- places windows by tmux session name;
+- treats Warp as a phase 2 that depends on two experiments;
+- lists nine steps, verification cases V1–V6 and five decisions for the user.
+
+The server's address is written as a placeholder. The README links the plan, and
+limitation 1 of `session_restore_plan.md` now points to it. Committed on 2026-11-14 as
+`fefa009`. Nothing in it is implemented yet.
 
 ## Commits not attributed here
 
