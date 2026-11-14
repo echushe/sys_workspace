@@ -574,13 +574,48 @@ This also avoids the one rough edge of `udisksctl`: these are internal drives
 (`HintSystem: true`), so PolicyKit may ask for a password when mounting them on
 a machine whose rules require it — see the note under "Scanning `$HOME`".
 
+## Commit hooks
+
+No login credentials -- keys, tokens, passwords -- belong in this repository.
+`githooks/` holds two hooks that refuse a commit that would add one. Turn them
+on once per clone:
+
+```sh
+git config core.hooksPath githooks
+```
+
+- `pre-commit` scans the lines a commit adds, and the names of files it adds
+  (`id_ed25519`, `*.pem`, `.env` and the like).
+- `commit-msg` scans the commit message.
+
+Both run `githooks/credential_check.py`. It looks for private-key blocks, SSH
+public keys and fingerprints, tokens in the formats AWS, GitHub, GitLab, Slack,
+OpenAI, Anthropic, Hugging Face, Stripe, npm and Google use, JWTs, passwords in
+URLs, `Authorization` headers, password and token assignments, `sshpass`, `sudo
+-S` and `curl -u`, and long random-looking strings. Matches are printed masked,
+so a real secret is not echoed into the terminal. For a false positive you have
+checked, add `credential-check: allow` to that line. `git commit --no-verify`
+skips the hooks altogether, and is the only way past a file flagged by its name.
+
+The same script audits files on demand, for example the whole tree:
+
+```sh
+git ls-files -z | xargs -0 /usr/bin/python3 githooks/credential_check.py
+```
+
+Limits: the hooks only guard commits made in a clone where `core.hooksPath` is
+set, and only catch what a pattern can recognise. A plain password with nothing
+around it that names it as one gets through. `tests/test_credential_check.py`
+also fails if any tracked file matches, so running the tests also checks what
+is already committed.
+
 ## Tests
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-326 tests. Mount branches are stubbed rather than run against real hardware --
+341 tests. Mount branches are stubbed rather than run against real hardware --
 see the section above. Terminal capture, VSCode and Chrome were all exercised
 against real state (a real gnome-terminal tab via `--rcfile`, matching how
 `restore` invokes shells; the real `storage.json`; the real Chrome session
