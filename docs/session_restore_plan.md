@@ -575,7 +575,10 @@ can be re-applied without relaunching anything.
 
 1. **Running commands are not resumed.** A reboot kills every process; only cwd and
    conda env are restorable. Nothing can change this short of `tmux`/`mosh`-style
-   persistent sessions, which a reboot also ends.
+   persistent sessions, which a reboot also ends. The exception is tmux running on
+   *another* machine, reached over mosh: its processes outlive the laptop's reboot,
+   so only the reconnect command needs replaying. See
+   [`mosh_tmux_restore_plan.md`](mosh_tmux_restore_plan.md).
 2. **Tab→window grouping is exact when AT-SPI is reachable, best-effort otherwise.**
    This limitation was originally stated as absolute: GNOME Terminal 42 exposes windows
    and screens as *flat, unrelated* D-Bus objects, VTE does not set `WINDOWID` here, the

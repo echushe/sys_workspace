@@ -6,6 +6,7 @@ workspace each window sat on.
 
 Design and rationale: [`docs/session_restore_plan.md`](docs/session_restore_plan.md).
 Record of the work done with Claude Code: [`docs/ai_history.md`](docs/ai_history.md).
+Planned: restoring mosh + tmux tabs, [`docs/mosh_tmux_restore_plan.md`](docs/mosh_tmux_restore_plan.md).
 
 ## Status
 
