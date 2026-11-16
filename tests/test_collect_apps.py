@@ -99,8 +99,11 @@ class VscodeTest(unittest.TestCase):
         self.addCleanup(os.unlink, tmp.name)
         with mock.patch.object(collect, "VSCODE_STORAGE", tmp.name):
             first = collect.collect_vscode()
+            previous_ns = os.stat(tmp.name).st_mtime_ns
             with open(tmp.name, "w") as f:
                 json.dump({"windowsState": {"openedWindows": [{"folder": "file:///b"}]}}, f)
+            # Same-sized writes can share the filesystem's timestamp tick.
+            os.utime(tmp.name, ns=(previous_ns + 1_000_000_000, previous_ns + 1_000_000_000))
             second = collect.collect_vscode(previous=first)
         self.assertEqual(
             [w["path"] for w in second["windows"]], ["/b"]

@@ -6,7 +6,7 @@ workspace each window sat on.
 
 Design and rationale: [`docs/session_restore_plan.md`](docs/session_restore_plan.md).
 Record of the work done with Claude Code: [`docs/ai_history.md`](docs/ai_history.md).
-Planned: restoring mosh + tmux tabs, [`docs/mosh_tmux_restore_plan.md`](docs/mosh_tmux_restore_plan.md).
+GNOME Terminal mosh + tmux restore: [`docs/mosh_tmux_restore_plan.md`](docs/mosh_tmux_restore_plan.md).
 
 ## Status
 
@@ -16,6 +16,7 @@ Step 6 of 7 from the plan's implementation order.
 |---|---|
 | Stage 0 — mounts | **done**; extended to scan `$HOME` for dangling symlinks and mount what they point at, verified live against five real disks |
 | Terminal capture (bash hook + `save`) | **done, hook installed** |
+| GNOME mosh + tmux reconnect | **implemented and deployed**; automated tests pass, live reconnect/reboot verification pending |
 | VSCode + Chrome collectors | **done** |
 | `restore` | **done, verified live end to end** |
 | Workspace layout (`place`) | **done, verified live end to end; one further bug found by a real restore and fixed** |
@@ -610,13 +611,48 @@ around it that names it as one gets through. `tests/test_credential_check.py`
 also fails if any tracked file matches, so running the tests also checks what
 is already committed.
 
+## Mosh + tmux tabs
+
+GNOME Terminal tabs running `mosh [user@]host -- tmux new -A -s NAME` can now
+be captured and reconnected after a laptop reboot. `tmux attach -t NAME` and
+its long aliases are accepted too. The session and its processes must still
+exist on the remote machine; a server reboot ends them.
+
+Run `sessionctl setup` after upgrading to deploy the code and shell hook.
+Existing hooked GNOME tabs can be detected without reopening them. Save with
+`sessionctl save`, inspect with `sessionctl show`, and review reconnect commands
+with `sessionctl restore --dry-run --only terminals`. Older snapshots contain no
+reconnect commands, so take a new snapshot while the mosh tabs are running.
+
+Restored tabs reconnect once, one second apart. On failure or detach, they
+return to a local prompt; Up-arrow recalls the command. No automatic retry runs.
+The connection metadata is saved even during the initial reconnect delay.
+
+Other tmux clients stay connected by default. To detach all other clients of
+restored sessions and clear their stale mosh-servers, use
+`sessionctl restore --detach-mosh`. This also detaches live clients on other devices.
+
+Only a narrow command grammar is replayed: no mosh options, shell commands,
+IPv6 literals, or complex tmux targets. Unsupported invocations are marked for
+manual reconnect and their command text is omitted. Saved commands are validated
+again on restore. Connection addresses stay in runtime state outside this repository.
+
+Window placement uses tmux's default `[NAME] 0:` status bar. If it cannot confirm
+the expected names and tab count, it leaves the window unplaced; run
+`sessionctl place` after the connections become ready. Custom status bars and
+duplicate session names on different servers can make placement ambiguous.
+
+Warp reconnect remains phase 2. Automated checks cover the GNOME implementation;
+a live remote reconnect and reboot cycle still need verification. See the
+[revised plan](docs/mosh_tmux_restore_plan.md) for the scope and verification steps.
+
 ## Tests
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-341 tests. Mount branches are stubbed rather than run against real hardware --
+355 tests. Mount branches are stubbed rather than run against real hardware --
 see the section above. Terminal capture, VSCode and Chrome were all exercised
 against real state (a real gnome-terminal tab via `--rcfile`, matching how
 `restore` invokes shells; the real `storage.json`; the real Chrome session

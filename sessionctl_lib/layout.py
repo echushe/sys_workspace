@@ -92,7 +92,7 @@ def _pump(duration):
 TERMINAL_CLASS = "Gnome-terminal"
 
 
-def _terminal_signature(slots, cwds=None):
+def _terminal_signature(slots, cwds=None, tmux=None):
     """A terminal window's identity, derived from the tabs it holds.
 
     Tab count first because it is available the instant a window maps; the
@@ -106,7 +106,12 @@ def _terminal_signature(slots, cwds=None):
     """
     if cwds is None:
         cwds = [(s.get("cwd") or "") for s in slots]
-    return {"tabs": len(slots), "cwds": sorted(set(cwds))}
+    sig = {"tabs": len(slots), "cwds": sorted(set(cwds))}
+    names = sorted(set(tmux if tmux is not None else
+                       [s["tmux"] for s in slots if s.get("tmux")]))
+    if names:
+        sig["tmux"] = names
+    return sig
 
 
 def _hook_window_cwds(terminals):
@@ -176,9 +181,17 @@ def _terminal_signatures(windows, terminals=None):
         # index-for-index pairing they rely on is not trustworthy. Same
         # policy as the frame-count check above: degrade, never guess.
         hook = None
+    remote_names = None
+    if hook is not None:
+        remote_names = [
+            [(t.get("resume") or {}).get("tmux_session") for t in w.get("tabs", [])
+             if (t.get("resume") or {}).get("tmux_session")]
+            for w in terminals["windows"]
+        ]
     return {
         w.get_xid(): _terminal_signature(
-            slots, None if hook is None else hook[i]
+            slots, None if hook is None else hook[i],
+            None if remote_names is None else remote_names[i]
         )
         for i, (w, slots) in enumerate(zip(live_terminals, frames))
     }
@@ -295,7 +308,7 @@ def _window_signatures(live_windows, terminals=None, warp_state=None):
 
 
 def _signature_score(rec_sig, live_sig):
-    """How strongly two tab signatures agree: 2 exact, 1 tab count only, 0 no.
+    """How strongly two tab signatures agree: 3 tmux, 2 cwd, 1 count, 0 no.
 
     Split in two because a just-launched terminal has its tabs immediately
     but not yet its prompts, so the directories arrive a moment later. Tab
@@ -304,6 +317,10 @@ def _signature_score(rec_sig, live_sig):
     """
     if not rec_sig or not live_sig:
         return 0
+    if rec_sig.get("tmux"):
+        # Wait for all expected status bars; directories may belong to remote hosts.
+        return 3 if (rec_sig["tmux"] == live_sig.get("tmux")
+                     and rec_sig.get("tabs") == live_sig.get("tabs")) else 0
     if rec_sig.get("tabs") != live_sig.get("tabs"):
         return 0
     return 2 if rec_sig.get("cwds") == live_sig.get("cwds") else 1
@@ -518,6 +535,8 @@ def match_windows(recorded, live, strict=False):
     for rec in recorded:
         cls = rec.get("wm_class", "")
         candidates = [w for w in live_pool if w.get("wm_class") == cls]
+        if (rec.get("sig") or {}).get("tmux"):
+            candidates = [w for w in candidates if _signature_score(rec["sig"], w.get("sig")) == 3]
         if not candidates:
             unmatched_recorded.append(rec)
             continue

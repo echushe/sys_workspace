@@ -1,241 +1,178 @@
 # Plan: Restore mosh + tmux Terminal Tabs
 
-**Date:** 2026-11-13
-**Status:** proposed, nothing implemented. All facts below were measured on 2026-11-13, with the repository at
-`ff2922f`.
-**Scope:** `sessionctl_lib/collect.py`, `snapshot.py`, `restore.py`, `layout.py`, `cli.py` (`show`), `bash-hook.sh`,
-their tests, the README and [`session_restore_plan.md`](session_restore_plan.md). Warp, VSCode and Chrome handling do
-not change in phase 1. Nothing on the server changes unless you run the optional clean-up in step 8.
-
-The server is called `shengcn-server` below, and its address is written as `<server>`. Neither the address nor
-anything secret belongs in this repository.
+**Date:** 2026-11-13; revised 2026-11-16.
+**Status:** phase 1 implemented in the working tree; automated verification complete.
+Live remote reconnect, window placement and reboot verification remain pending.
+**Scope:** GNOME Terminal capture, snapshots, command display, restore, shell hook and placement.
+Warp is phase 2 and remains an investigation. SSH and local tmux are outside this change.
 
 ## Goal
 
-1. A gnome-terminal tab that was running `mosh <server> -- tmux new -A -s <name>` before a reboot comes back running
-   the same command. It reattaches to the same tmux session, with its processes, scrollback and working directories
-   as they were.
-2. Orphaned mosh-servers on the server stop accumulating with every laptop reboot.
-3. Terminal windows are placed by their tmux session names, which are unique. Titles and prompts are not.
+Restore GNOME Terminal tabs that ran `mosh <server> -- tmux new -A -s <session>`.
+The laptop starts a new mosh connection to the tmux session still running on the server.
+Processes survive a laptop reboot because they run on the server. A server reboot ends them.
 
-## Where things stand
+Tests and documentation use `example.test` or `<server>`. Actual connection addresses belong in
+runtime snapshots under the user's state directory, outside the repository. Credentials never belong here.
 
-| | Laptop | Server |
-| --- | --- | --- |
-| System | Ubuntu 22.04.5, X11, `Linger=no` | up since 2026-11-02 14:19 (UTC+8) |
-| tmux, mosh | 3.2a, 1.3.2 | 3.2a, 1.3.2; tmux status bar on |
-| Terminals | gnome-terminal 3.44.0 (VTE 0.68), Warp 0.2026.11.11 | — |
-| mosh processes | 11 `mosh-client`, one per mosh tab | 100 `mosh-server` |
+## Where things stood on November 13
 
-- **Which tabs run mosh.** 11 of the 18 gnome-terminal tabs run `mosh <user>@<server> -- tmux new -A -s <name>`.
-  Window 0 holds `mnt_0`, `mnt_4` and `mnt_1` plus 6 local tabs. Window 1 holds `daily_0` to `daily_7`. Window 2
-  holds one local tab. No Warp pane runs mosh, ssh or tmux: Warp's own database records none of those commands.
-- **What a restore does now.** `latest.json` from 16:37 records all 18 tabs as `~` with conda env `base`. A restore
-  opens 18 local shells, and the 11 mosh commands have to be typed again. The hook writes a tab's state only at a
-  prompt, and a tab running mosh never gets back to one. So the record is the local shell's state from before mosh
-  started, with no sign that mosh is running.
-- **AT-SPI reads through mosh.** The prompt parser in `collect.atspi_window_tabs` reads the *server's* prompt
-  inside tmux and takes it for the tab's local directory and env. For example, it reports `torch209` in
-  `~/Projects/finance/stock_mnt` for a tab recorded locally as `~` with `base`. This does no harm today only because
-  every local record is the same.
-- **Orphans on the server.** By start date, the 100 mosh-servers are: Nov 2 (16), Nov 3 (1), Nov 4 (1), Nov 7 (24),
-  Nov 9 (26), Nov 11 (17) and Nov 13 (15). Some tmux sessions have 7 clients attached. In `daily_0` the newest client
-  was created at 12:39 server time, which is 15:39 on the laptop and matches its live tab. The other six date from
-  earlier boots. `MOSH_SERVER_NETWORK_TMOUT` is unset, so an orphan waits for its client forever and keeps one of the
-  roughly 1,000 UDP ports from 60000 to 61000.
+The laptop had 18 GNOME Terminal tabs, including 11 mosh clients. The server had 100 mosh-server
+processes and several tmux sessions with multiple clients from previous laptop boots. Both machines
+had tmux 3.2a and mosh 1.3.2. Warp had no mosh tabs.
 
-## Facts the design rests on
+Sessionctl saved only the local directory and conda environment. All 11 mosh commands had to be
+entered again after restoring. The local hook stops seeing prompts while mosh runs, and AT-SPI
+reads the remote prompt as if it were local. However, it can also read tmux's default status bar,
+which identifies the remote session and can distinguish otherwise identical terminal windows.
 
-1. **The state is kept by tmux on the server, not by mosh.** A new mosh client cannot reattach to an old
-   mosh-server. The documented way back is to run a multiplexer on the server
-   ([mosh.org FAQ](https://mosh.org/), [mosh-server(1)](https://man.archlinux.org/man/mosh-server.1.en.txt)).
-   `tmux new -A -s NAME` attaches if the session exists and creates it otherwise, so it is safe to replay any number
-   of times. Plain ssh with tmux would come back the same way after a reboot. What mosh adds is surviving sleep and
-   network changes without dropping the connection.
-2. **The command can be read back from `/proc`.** The `mosh` wrapper ends with
-   `exec {$client} ("$client", "-# @cmdline |", $ip, $port)` (line 456 of `/usr/bin/mosh`). So `mosh-client`'s
-   `argv[1]` is the original command line, joined with spaces. Its parent is the tab's shell, and it leads the
-   terminal's foreground process group: field 8 (`tpgid`) of `/proc/<shell>/stat` equals `mosh-client`'s pgid.
-   Joining with spaces loses quoting, so an argument containing spaces, such as `--ssh="ssh -p 2222"`, cannot be
-   split back reliably.
-3. **Each mosh tab can be identified on screen.** tmux's default status bar starts with `[<session>] `, and AT-SPI
-   exposes it. A probe that read only that pattern found exactly the 11 session names, in the right windows.
-4. **Orphans can be cleared without losing the session.** This was tested locally, with a mosh-server bound to
-   127.0.0.1 and a scratch tmux socket:
-   - Killing `mosh-client` left the mosh-server running with its tmux client still attached. That is the state the
-     server is in now.
-   - `tmux detach-client -s x` made that mosh-server exit within one second. Session `x` and its processes survived.
+These are historical measurements, not current session counts.
 
-   `tmux new -A -D -s NAME` does the same detach when a new client attaches.
-5. **The command has to run at the first prompt, not during `~/.bashrc`.** In bash 5.1.16, `history -s` while
-   `~/.bashrc` runs left the shell without its loaded history. The same call at the first prompt landed last, after
-   the loaded history, which is what Up-arrow needs.
-6. **mosh has to run inside the interactive shell.** Restore launches each tab as `bash -c '… exec bash -i'`. The
-   interactive shell's parent is then gnome-terminal-server, so `_is_live_gnome_tab` accepts its record. If mosh ran
-   under `bash -c` before the interactive shell started, the tab would have no hook record. It would then drop out of
-   the next save, and out of the next restore.
-7. **sshd limits simultaneous logins.** The server has no `MaxStartups` setting, so OpenSSH's default `10:30:100`
-   applies: once 10 logins are still being authenticated, further ones start being refused at random. Restoring 11
-   mosh tabs at once means 11 ssh logins at once.
+## Revision decisions
+
+1. **Validate twice.** Validate at collection and again when building restore commands. Snapshots can be
+   edited, and a `resume` field must never become an arbitrary command execution facility.
+2. **Use a small grammar.** Accept a hostname or IPv4 address, an optional username, `-- tmux`, and
+   explicit new/attach commands with a simple session name. Reject mosh options, quoted arguments,
+   shell commands, IPv6 literals, detached creation and window/pane target syntax. Broader support
+   needs separate tests because mosh's process title loses argument boundaries.
+3. **Omit rejected command text.** Store only `{"kind":"mosh","replay":false}` for unsupported mosh
+   commands. Raw text may contain credentials or an arbitrary command. Show a manual reconnect notice.
+4. **Make detachment explicit.** Ordinary restore preserves clients on other devices. `restore --detach-mosh`
+   adds `-D` to the normalized tmux new-session command, detaching ALL other clients of that session.
+   This clears stale mosh-server clients but also disconnects live clients on other devices.
+5. **Pace connections.** Use delays of 0, 1, 2, … seconds across reconnectable tabs in all windows.
+   This reduces simultaneous authentication; it does not guarantee staying below sshd's MaxStartups
+   limit when authentication takes longer than the interval. Failure returns to a local prompt for retry.
+6. **Preserve pending reconnects.** Write the state file before waiting or connecting. Include a validated
+   pending command during startup so a periodic save cannot erase the reconnect intent during the delay.
+7. **Wait for reliable placement.** Require the full set of tmux session names and tab count for matching
+   remote windows. If status bars are unavailable, leave them unplaced and allow `sessionctl place` later.
+8. **Keep server maintenance separate.** Never infer that an older client is orphaned merely from its age.
+   No automatic server-wide cleanup, timeout changes or remote process termination.
 
 ## Design
 
-### Capture (`collect.py`)
+### Capture and validation (`remote.py`, `collect.py`)
 
-- **Detection.** For each live gnome-terminal tab record, read the shell's `tpgid`. If a foreground job is running,
-  look for a child of the shell in that group whose `comm` is `mosh-client` and whose `argv[1]` starts with `-# `.
-  Read only its `cmdline`, never its `environ`: the mosh session key is passed through the environment.
-- **Parsing.** `parse_mosh(argv)` returns `{"kind": "mosh", "args": [...], "tmux_session": NAME}`. It accepts only
-  this shape:
-  - mosh options with no spaces in them, then `[user@]host`, then `--`;
-  - then either `tmux new` / `new-session` with `-s NAME`, optionally with `-A`, `-D` or `-d`;
-  - or `tmux attach` / `attach-session` / `a` with `-t NAME`.
+Read the terminal shell's foreground process group from `/proc/<pid>/stat`, parsing after the last
+`)` because process names can contain spaces and parentheses. Inspect only direct children in that group.
+A child named `mosh-client` is parsed from its cmdline; its environment is never read. Process exits and
+permission failures degrade to no detection without failing the save.
 
-  Anything else is recorded as `{"kind": "mosh", "raw": "...", "replay": false}`. `show` displays it, and restore
-  never replays it.
-- **The tab record** gains a `resume` field, which is absent for local tabs.
-- **ssh** could use the same mechanism for `ssh -t <server> tmux …`. It is left out until it is needed: there are no
-  ssh tabs today, and ssh port forwards (`-D`, `-L`, `-N`) must never be replayed.
+Mosh 1.3.2 puts the original invocation into argv[1] as `-# <space-joined arguments> |`.
+Only this exact shape is accepted. The allowed command forms are:
 
-### Snapshot (`snapshot.py`, `cli.py`)
+```text
+mosh [user@]host -- tmux new [-A] [-D] -s NAME
+mosh [user@]host -- tmux new-session [-A] [-D] -s NAME
+mosh [user@]host -- tmux attach [-d] -t NAME
+mosh [user@]host -- tmux attach-session [-d] -t NAME
+mosh [user@]host -- tmux a [-d] -t NAME
+```
 
-- **Digest.** Each tab becomes `[cwd, conda, resume command or None]`, so starting or stopping mosh in a tab counts
-  as a real change.
-- **`show`** prints a mosh tab as `mosh <host> → tmux <name>`.
-- **Old snapshots** have no `resume` field and restore exactly as they do now.
+Flags precede the target and cannot repeat. NAME contains letters, digits, underscores and hyphens,
+starts with a letter, digit or underscore, and has at most 128 characters. Hostnames and usernames
+use a similarly restricted character set. All accepted forms normalize to
+`mosh [user@]host -- tmux new-session -A -s NAME`. Original detach flags are not silently carried over;
+only `--detach-mosh` requests detachment on restore.
 
-### Restore (`restore.py`, `bash-hook.sh`)
+The tab gains `resume = {kind, args, tmux_session}`. Local tabs have no `resume`. An unsupported foreground
+mosh client gets the nonreplayable marker. A hook's pending command is validated with the same grammar.
+SSH port forwards and other processes are never replayed.
 
-- **Tab command.** `_tab_script` becomes
-  `SESSIONCTL_CONDA=<env> SESSIONCTL_RESUME=<shlex.join(args)> SESSIONCTL_RESUME_DELAY=<n> exec bash -i`.
-- **The hook.** While `~/.bashrc` runs, the hook moves `SESSIONCTL_RESUME` into a shell variable and unsets the
-  environment variable, so child processes do not inherit it. In `PROMPT_COMMAND`, *after* `_sessionctl_save` has
-  written the state file (fact 6), a one-shot function:
-  - waits the delay;
-  - adds the command to history with `history -s` (fact 5);
-  - runs it, then clears the variable.
+### Snapshot and display (`snapshot.py`, `cli.py`)
 
-  When mosh exits, whether from a detach, a network failure or an unreachable server, the tab is at its local prompt,
-  and Up-arrow brings the command back.
-- **Orphans.** When replaying, `-D` is added to `tmux new -A` (decision 1). This clears the previous boot's orphan
-  for every session that is restored.
-- **Stagger.** The delay is the tab's index in seconds (decision 3), which keeps the logins under sshd's limit
-  (fact 7).
-- **No network yet.** If the network isn't up yet, mosh fails and the tab is left at a local prompt. Up-arrow and
-  Enter retry. There is deliberately no retry loop, so a dead server cannot keep a tab busy.
+The restore digest includes `resume`: starting, stopping or switching a mosh session changes the snapshot.
+`show` prints `mosh <host> → tmux <session>` for supported commands and a manual reconnect notice otherwise.
+Old snapshots have no reconnect metadata and keep their previous behavior. The first save after upgrade may
+write a new digest even for an otherwise unchanged local session because the digest schema now includes resume.
+
+### Restore and shell hook (`restore.py`, `bash-hook.sh`)
+
+`_tab_script` validates snapshot arguments again before passing a canonical command through
+`SESSIONCTL_RESUME`, alongside `SESSIONCTL_RESUME_DELAY` and the existing conda restore variable.
+Malformed metadata produces an ordinary interactive shell.
+
+The hook consumes and unsets reconnect environment variables before invoking children. It records its state
+before the first prompt action, waits the delay, adds the command to Bash history, and runs a Bash argv array.
+There is no `eval` or command substitution. When mosh returns, it clears pending metadata and updates the
+state file. The original interactive shell stays the terminal server's child, satisfying capture liveness checks.
+Subsequent prompts do not reconnect again. Up-arrow can retry a failed connection.
+
+The one-second delay counter advances only for supported mosh tabs and continues across windows.
+`--detach-mosh` affects only those commands. Normal restore requires no server configuration changes.
 
 ### Grouping and placement (`collect.py`, `layout.py`)
 
-- **Status bar.** `prompt_of` also returns the session name read from the tmux status bar
-  (`^\[([^\]]+)\] \d+:`) as `slot["tmux"]`. The probe reads only that one pattern, so it never collects what is on
-  screen. When a tab shows a tmux name, its prompt-derived directory and env are ignored, because they are the
-  server's.
-- **Grouping.** `_group` gets a new first pass: a tab whose `resume.tmux_session` equals a slot's `tmux` claims that
-  slot.
-- **Placement.** `_terminal_signature` adds the sorted tmux names. Capture takes them from the `resume` records, and
-  the live side reads them from the status bars. Agreement on tmux names ranks above agreement on tab count and
-  directories.
-- **Timing.** A restored window shows its status bars a few seconds after launch, which should fall inside
-  `SETTLE_GRACE` (20 s). This must be checked, because of the stagger (V5).
+Read the last 600 characters of the accessible terminal text, as before. Recognize tmux's default status
+bar prefix `[NAME] 0:`; emit only the name as `slot.tmux`. If it is present, suppress remote prompt-derived
+cwd and conda. Match records by session name before local cwd/env matching.
 
-## Steps
+Record sorted tmux names in terminal window signatures. During placement, require those names and tab count
+to agree. This applies after the settle grace too, so slow logins cannot cause a guess against another window.
+Existing timeouts still bound placement; after connecting, run `sessionctl place` again if necessary.
 
-1. Add `parse_mosh` and foreground detection to `collect.py`. Unit tests use the real argv shapes from this machine,
-   with a placeholder for the address.
-2. Wire `resume` into `collect_terminals`, `digest` and `show`, with tests.
-3. Add `SESSIONCTL_RESUME`, the delay and the `-D` rewrite to `restore._tab_script`. Test argv construction and
-   quoting, including the two unquoting passes `--command=` already goes through.
-4. Add the one-shot to `bash-hook.sh`. Test it the way the hook is already tested: real bash through `--rcfile` in a
-   pty, with a stub `mosh` script that records its arguments and exits. Check the history order, the state file
-   written before the command runs, and the variable not being inherited.
-5. Read the tmux status bar in the AT-SPI probe, then add the `_group` pass and the signature field. Tests use
-   recorded slot shapes.
-6. Docs: the README's terminal section and limitations, limitation 1 in `session_restore_plan.md`, and an entry in
-   `ai_history.md`.
-7. Deploy with `sessionctl setup`. This also brings the installed copy up to date with `583e540`; it is currently
-   behind the repository.
-8. Optional, run by you on the server: the one-off orphan clean-up below.
-9. Run verification V1–V5, then V6 with a real reboot.
+Status bars customized away from the default pattern, duplicate names on different hosts, and inaccessible
+AT-SPI make identity ambiguous. Those cases need better terminal-to-screen identity before claiming exact placement.
+
+## Implementation steps
+
+1. Add shared parsing, validation and foreground discovery in `remote.py`.
+2. Add resume metadata to collection, snapshot digests and `show`.
+3. Add validated restore assignments, global reconnect delays and `--detach-mosh`.
+4. Add the first-prompt reconnect action, pending metadata and history support to the shell hook.
+5. Add status-bar grouping and remote window signatures, with conservative placement.
+6. Add parser, process-race, snapshot, restore and real Bash startup tests; update documentation and AI history.
+7. Deploy using `sessionctl setup`. The tool deliberately runs from an installed copy rather than this checkout.
+8. Verify real connections with a dedicated scratch session, then placement and a user-initiated reboot.
 
 ## Verification
 
-- **V1.** `sessionctl save --dry-run` shows `resume` on exactly 11 tabs: `mnt_0`, `mnt_1`, `mnt_4` and
-  `daily_0`–`daily_7`. The 7 local tabs have none.
-- **V2.** `sessionctl restore --dry-run --only terminals` prints 3 windows with 18 tabs. The 11 mosh commands are
-  right, with `-D` added and delays from 0 upwards.
-- **V3.** A real restore of one throwaway tab against a throwaway session (`sessionctl_probe` on the server, killed
-  afterwards):
-  - it attaches;
-  - its state file exists, and `save --dry-run` shows the tab with `resume`;
-  - after a detach (prefix, then `d`), the tab is at a local prompt and Up-arrow gives the mosh command.
-- **V4.** After V3 has been repeated twice, `sessionctl_probe` has one client, and the server's mosh-server count is
-  back where it started.
-- **V5.** Shuffle windows 0 and 1, then run `sessionctl place` from the current snapshot: both return to their
-  places, matched by tmux names.
-- **V6.** After a real reboot, `sessionctl restore` brings back all 11 tabs, attached to the same sessions in the same
-  windows. The server's mosh-server count does not grow by 11.
-- **The full test suite passes**, including the credential check.
+Automated checks cover:
 
-## Warp (phase 2, only if mosh is used in Warp)
+- Accepted aliases, canonicalization and opt-in detachment.
+- Rejection of shell syntax, options, trailing commands, malformed snapshots and detached creation.
+- Foreground/direct-parent checks, process names containing parentheses, process exits and missing `/proc` files.
+- Collection of pending metadata, digest changes and grouping by session name.
+- Missing/wrong tmux signatures remaining unplaced even outside the settling period.
+- Restore argument quoting and stagger numbering across windows.
+- A real interactive Bash in a pseudo-terminal with a stub mosh executable: history order, state written before
+  execution, reconnect variables absent from child environments, exact argv, one execution, cleared pending state,
+  and state-file cleanup when the shell exits.
+- Full unit suite, credential check, `bash -n` and `git diff --check`.
 
-No Warp pane runs mosh, ssh or tmux today. Warp's own restore brings back windows, tabs, panes and recent blocks, but
-it does not re-run commands ([session restoration](https://docs.warp.dev/terminal/sessions/session-restoration)).
-Warp also has no mosh support, and its tmux-based SSH mode has been removed
-([SSH](https://docs.warp.dev/terminal/warpify/ssh/)).
+Live checks, pending:
 
-The route would be the same one-shot in the hook. Warp's restore cannot pass environment variables, so the commands
-would be looked up by pane UUID in a file that `sessionctl restore` writes. Two experiments come first:
+1. Capture currently running mosh tabs with pruning disabled; compare counts and names with the desktop.
+2. Inspect a restore dry run. Do not replay an entire desktop merely to test command generation.
+3. Connect a throwaway tab to a dedicated scratch tmux session; detach and verify return to a local prompt.
+4. Repeat with `--detach-mosh` only on that scratch session and confirm the previous mosh-server exits.
+5. Verify placement with the remote tabs connected. Test a delayed/unavailable network: unconfirmed windows
+   should remain unplaced, and manual retry followed by `place` should work.
+6. After a user-initiated laptop reboot, restore and compare remote sessions, windows and server counts.
 
-- **W1.** Quit and reopen Warp, and check whether pane UUIDs survive: `terminal_panes.uuid`, and
-  `WARP_TERMINAL_SESSION_UUID` in the shells. The existing data cannot show this, because Warp started at 15:31,
-  before the first snapshot that recorded its panes.
-- **W2.** Check whether running a full-screen program from the first prompt breaks Warp's shell integration. Warp
-  moves `PROMPT_COMMAND` into its own precmd chain.
+## Warp (phase 2)
 
-If W1 fails, the fallback is [Tab Configs](https://docs.warp.dev/terminal/windows/tab-configs/). They live in
-`~/.local/share/warp-terminal/tab_configs/`, can run commands per pane, and open with
-`warp://tab_config/<name>`, which is registered on this machine through `dev.warp.Warp.desktop`. But they open new
-tabs next to the ones Warp restores, so sessionctl would have to take over Warp's restore entirely. That is not
-planned.
+Warp's native restore reopens panes but does not replay their commands. Implementing this for Warp requires:
 
-## Not covered
+- W1: prove pane UUIDs survive a quit/reopen cycle before using a UUID-indexed reconnect file.
+- W2: prove a first-prompt full-screen reconnect is compatible with Warp's shell integration.
 
-- **Local tmux.** It ends at a reboot, and also at logout because `Linger=no`, so it would need tmux-resurrect to
-  survive. Inside it the hook's liveness check rejects the shell, because its parent is tmux. sessionctl already
-  restores local tabs.
-- **Server reboots.** The tmux sessions end with the server, and replaying then creates empty sessions. tmux-resurrect
-  on the server would be a separate plan.
-- **ssh tabs.** See *Capture*.
+Neither experiment is covered by the GNOME phase. The hook mechanism exists but there is no Warp capture/replay
+wiring. Do not claim Warp support from the GNOME tests.
 
-## Points to be aware of
+## Deployment and results
 
-- **Restore runs commands automatically.** Only the shape `parse_mosh` accepts is ever replayed. The parser is the
-  safety boundary, so it gets the most tests.
-- **`-D` affects other devices.** It detaches a session from every other client, so a tmux session that is also open
-  on another device gets detached there.
-- **Snapshots hold the server address.** They live in `~/.local/state/sessionctl`, outside the repository. Tests and
-  docs use placeholders.
-- **The mosh session key is never read.** It is in `mosh-client`'s environment, which sessionctl does not read.
+Implemented and deployed on November 16 with `sessionctl setup`. All 355 tests pass, including 14 new tests.
+The installed modules and hook were compared with the checkout. A read-only desktop capture found 3 windows
+with 19 tabs, and no running mosh clients, so it could not confirm a real reconnect command against live tabs.
+Live remote reconnect, window movement and reboot checks remain pending. No server cleanup was performed.
+The November 13 observation that the installed copy lagged the repository is historical.
 
-## Decisions
+## References
 
-1. Add `-D` when replaying? **Recommended: yes.** It clears the orphans of exactly the sessions being restored, and
-   needs no change on the server.
-2. Set `MOSH_SERVER_NETWORK_TMOUT`? **Recommended: not now.** `-D` already handles restored sessions. A timeout would
-   also end connections while the laptop sleeps for longer than the timeout. If set, use a long one, such as
-   `mosh --server='env MOSH_SERVER_NETWORK_TMOUT=2592000 mosh-server' …`.
-3. Stagger reconnects by 1 s per tab? **Recommended: yes.**
-4. Cover ssh tabs too? **Recommended: not now.**
-5. Clean up the existing orphans (step 8)? **Recommended: yes, once, run by you.**
-
-**Step 8, run on the server.** For each session, this keeps the newest client and detaches the rest. The newest is
-the live laptop tab, because live tabs were attached after the latest reboot. A detached orphan's mosh-server then
-exits (fact 4). It also detaches older clients on any other device. Run it first with `echo` in front of `tmux
-detach-client` to see what it would do:
-
-```sh
-for s in $(tmux list-sessions -F '#S'); do
-  tmux list-clients -t "$s" -F '#{client_created} #{client_name}' | sort -n | head -n -1 |
-    while read -r _ c; do tmux detach-client -t "$c"; done
-done
-```
+- [Mosh FAQ](https://mosh.org/): persistent terminal sessions belong in a remote multiplexer.
+- [mosh-server manual](https://man.archlinux.org/man/mosh-server.1.en.txt): timeout behavior.
+- Installed mosh 1.3.2 wrapper, `/usr/bin/mosh`: synthetic process-title construction.
+- [Main session restore plan](session_restore_plan.md).

@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import sys
 
-from . import (collect, config, layout, mounts, paths, restore, setup,
+from . import (collect, config, layout, mounts, paths, remote, restore, setup,
                snapshot, warp)
 
 RESTORE_KINDS = ("terminals", "warp", "vscode", "chrome", "layout")
@@ -402,7 +402,9 @@ def cmd_restore(args):
 
     plan = []
     if "terminals" in only:
-        for argv in restore.terminal_commands(snap.get("terminals", {})):
+        for argv in restore.terminal_commands(
+            snap.get("terminals", {}), detach_mosh=getattr(args, "detach_mosh", False)
+        ):
             plan.append(("terminal", argv))
     if "warp" in only:
         # warp.running() is read now, not taken from the snapshot: the snapshot
@@ -566,6 +568,12 @@ def cmd_show(args):
         for t in w.get("tabs", []):
             env = f"({t['conda']}) " if t.get("conda") else ""
             print(f"  {env}{t.get('cwd')}")
+            resume = t.get("resume") or {}
+            replay = remote.replay_args(resume)
+            if replay:
+                print(f"    mosh {replay[1]} → tmux {replay[-1]}")
+            elif resume:
+                print("    mosh (unsupported command; reconnect manually)")
 
     warp_windows = snap.get("warp", {}).get("windows", [])
     if warp_windows:
@@ -713,6 +721,10 @@ def build_parser():
         "--chrome-urls", action="store_true",
         help="open Chrome's recorded URLs explicitly instead of relying on "
              "its own restore_on_startup",
+    )
+    r.add_argument(
+        "--detach-mosh", action="store_true",
+        help="detach other tmux clients when reconnecting mosh tabs (affects other devices)",
     )
     r.set_defaults(func=cmd_restore)
 

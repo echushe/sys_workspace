@@ -1,6 +1,6 @@
 # AI History
 
-Jobs done by Claude Code on sessionctl between 2026-08-24 and 2026-11-14, oldest first.
+Jobs done by Claude Code and Codex on sessionctl between 2026-08-24 and 2026-11-16, oldest first.
 Each entry covers one job, or one day of closely related jobs, in roughly 100–250 words.
 
 sessionctl did not start in this repository. From 2026-08-24 to 2026-09-21 it lived in
@@ -317,7 +317,27 @@ The plan:
 
 The server's address is written as a placeholder. The README links the plan, and
 limitation 1 of `session_restore_plan.md` now points to it. Committed on 2026-11-14 as
-`fefa009`. Nothing in it is implemented yet.
+`fefa009`. At that point nothing in it was implemented.
+
+## 2026-11-16 — Revised and implemented GNOME mosh + tmux reconnect
+
+Codex revised `docs/mosh_tmux_restore_plan.md` and implemented phase 1. A shared
+`remote.py` validates a narrow mosh/tmux grammar at collection and again at replay.
+Only direct foreground mosh-client children are detected; their environments and
+session keys are never read. Unsupported commands get a nonreplayable marker, with
+no raw text retained. Snapshots and `show` include reconnect metadata. The shell
+hook records pending reconnects before waiting, runs the canonical argv once at
+the first prompt, adds it to history and returns to the local shell when it ends.
+Reconnects are paced across windows. Detaching other devices is now an explicit
+`restore --detach-mosh` option rather than an automatic effect. AT-SPI reads tmux
+status-bar names for grouping and placement; unconfirmed remote windows remain
+unplaced. Tests include a real interactive Bash with a stub mosh command, process
+races, malformed snapshots, quoting, history and pending-state capture. The full
+suite passes (355 tests). An existing same-size VSCode cache test was made
+independent of filesystem timestamp granularity after it failed intermittently.
+Deployed with `sessionctl setup`; the installed modules and hook match the checkout.
+A read-only desktop check found 3 windows with 19 tabs and no mosh clients, so
+Warp wiring and live remote/reboot verification remain pending.
 
 ## Commits not attributed here
 

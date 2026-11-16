@@ -16,25 +16,34 @@ import os
 import shlex
 import subprocess
 
+from . import remote
+
 TERMINAL_APP = "gnome-terminal"
 VSCODE_APP = "code"
 CHROME_APP = "google-chrome"
 WARP_APP = "warp-terminal"
 
 
-def _tab_script(tab):
+def _tab_script(tab, delay=0, detach_mosh=False):
     """The command a restored tab runs: re-enter its conda env, then an
     interactive shell. Empty/whitespace conda names are treated as "none" --
     collect_terminals stores "" as null already, but a snapshot loaded from
     disk is just JSON and this stays defensive against a blank string too.
     """
     conda = (tab.get("conda") or "").strip()
+    assignments = []
     if conda:
-        return f"SESSIONCTL_CONDA={shlex.quote(conda)} exec bash -i"
-    return "exec bash -i"
+        assignments.append(f"SESSIONCTL_CONDA={shlex.quote(conda)}")
+    args = remote.replay_args(tab.get("resume"), detach=detach_mosh)
+    if args:
+        assignments.extend([
+            "SESSIONCTL_RESUME=" + shlex.quote(shlex.join(args)),
+            f"SESSIONCTL_RESUME_DELAY={delay}",
+        ])
+    return " ".join(assignments + ["exec bash -i"])
 
 
-def terminal_commands(terminals):
+def terminal_commands(terminals, detach_mosh=False):
     """One gnome-terminal argv per recorded window.
 
     gnome-terminal only honours ONE trailing "-- COMMAND" for the whole
@@ -47,6 +56,7 @@ def terminal_commands(terminals):
     support this. There is no non-deprecated way to do this.
     """
     commands = []
+    resume_index = 0
     for window in terminals.get("windows", []):
         tabs = window.get("tabs", [])
         if not tabs:
@@ -57,7 +67,9 @@ def terminal_commands(terminals):
             cwd = tab.get("cwd")
             if cwd:
                 argv.append(f"--working-directory={cwd}")
-            argv.append("--command=" + "bash -c " + shlex.quote(_tab_script(tab)))
+            argv.append("--command=" + "bash -c " + shlex.quote(_tab_script(tab, resume_index, detach_mosh)))
+            if remote.replay_args(tab.get("resume")):
+                resume_index += 1
         commands.append(argv)
     return commands
 

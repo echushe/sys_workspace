@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 
-from . import paths
+from . import paths, remote
 
 TERMINAL_SERVER = "gnome-terminal-server"
 
@@ -239,6 +239,16 @@ def collect_terminals(prune=True):
         for r in records
     ]
 
+    for tab, record in zip(tabs, records):
+        resume = remote.foreground_mosh(tab["pid"])
+        pending = record.get("resume_pending")
+        if resume is None and isinstance(pending, str):
+            args = remote.validate_args(pending.split(" "))
+            if args:
+                resume = {"kind": "mosh", "args": args, "tmux_session": args[-1]}
+        if resume is not None:
+            tab["resume"] = resume
+
     _, windows = dbus_tree()
     window_count = max(1, len(windows)) if tabs else len(windows)
 
@@ -334,22 +344,27 @@ def terminal_under(node):
 def prompt_of(tab):
     term = terminal_under(tab)
     if term is None:
-        return None, None
+        return None, None, None
     try:
         n = Atspi.Text.get_character_count(term)
         # The tail: offset 0 is the top of the scrollback, not the prompt.
         raw = Atspi.Text.get_text(term, max(0, n - 600), n)
     except Exception:
-        return None, None
-    for line in reversed([l for l in raw.splitlines() if l.strip()]):
+        return None, None, None
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    for line in reversed(lines):
+        m = re.match(r"^\[([A-Za-z0-9_-]+)\] \d+:", line)
+        if m:
+            return None, None, m.group(1)
+    for line in reversed(lines):
         line = line.strip()
         m = WITH_ENV.match(line)
         if m:
-            return (m.group(1) or None), m.group(2)
+            return (m.group(1) or None), m.group(2), None
         m = NO_ENV.match(line)
         if m:
-            return None, m.group(1)
-    return None, None
+            return None, m.group(1), None
+    return None, None, None
 
 windows = []
 for i in range(app.get_child_count()):
@@ -358,8 +373,8 @@ for i in range(app.get_child_count()):
         continue
     slots = []
     for tab in tabs_under(fr):
-        conda, cwd = prompt_of(tab)
-        slots.append({"title": tab.get_name() or "", "conda": conda, "cwd": cwd})
+        conda, cwd, tmux = prompt_of(tab)
+        slots.append({"title": tab.get_name() or "", "conda": conda, "cwd": cwd, "tmux": tmux})
     if slots:
         windows.append(slots)
 print(json.dumps(windows or None))
@@ -441,12 +456,15 @@ def _group(tabs, window_count, window_slots=None):
                         groups[gi][si] = match
 
         claim(lambda t, s: (
-            s.get("cwd") and t.get("cwd")
+            s.get("tmux") and s["tmux"] == (t.get("resume") or {}).get("tmux_session")
+        ))
+        claim(lambda t, s: (
+            not s.get("tmux") and not t.get("resume") and s.get("cwd") and t.get("cwd")
             and s["cwd"] == _abbreviated(t["cwd"])
             and _norm_env(s.get("conda")) == _norm_env(t.get("conda"))
         ))
         claim(lambda t, s: (
-            s.get("cwd") and t.get("cwd")
+            not s.get("tmux") and not t.get("resume") and s.get("cwd") and t.get("cwd")
             and s["cwd"] == _abbreviated(t["cwd"])
         ))
         claim(lambda t, s: True)

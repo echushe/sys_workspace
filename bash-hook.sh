@@ -32,6 +32,12 @@ fi
 [[ -n "$_SESSIONCTL_HOOKED" ]] && return 0
 _SESSIONCTL_HOOKED=1
 
+# Consume restore metadata before running conda or any child process.
+_sessionctl_resume=${SESSIONCTL_RESUME:-}
+_sessionctl_resume_delay=${SESSIONCTL_RESUME_DELAY:-0}
+unset SESSIONCTL_RESUME SESSIONCTL_RESUME_DELAY
+[[ $_sessionctl_resume_delay =~ ^[0-9]{1,4}$ ]] || _sessionctl_resume_delay=0
+
 _sessionctl_dir="${XDG_STATE_HOME:-$HOME/.local/state}/sessionctl/shells"
 _sessionctl_file="$_sessionctl_dir/$$.json"
 _sessionctl_last=
@@ -40,11 +46,13 @@ _sessionctl_last=
 # builtin: the parameter expansions, printf, and the redirect. In the steady
 # state this is one string compare and nothing else.
 _sessionctl_save() {
-    local key="$PWD:$CONDA_DEFAULT_ENV"
+    local key="$PWD:$CONDA_DEFAULT_ENV:$_sessionctl_resume"
     [[ $key == "$_sessionctl_last" ]] && return 0
 
     local cwd=$PWD conda=$CONDA_DEFAULT_ENV screen=$GNOME_TERMINAL_SCREEN
     local uuid=$WARP_TERMINAL_SESSION_UUID
+    local pending=$_sessionctl_resume
+    pending=${pending//\\/\\\\}; pending=${pending//\"/\\\"}
     cwd=${cwd//\\/\\\\};       cwd=${cwd//\"/\\\"}
     conda=${conda//\\/\\\\};   conda=${conda//\"/\\\"}
     screen=${screen//\\/\\\\}; screen=${screen//\"/\\\"}
@@ -52,8 +60,8 @@ _sessionctl_save() {
 
     [[ -d $_sessionctl_dir ]] || mkdir -p "$_sessionctl_dir" 2>/dev/null || return 0
 
-    printf '{"pid":%d,"kind":"%s","screen":"%s","warp_uuid":"%s","cwd":"%s","conda":"%s","ts":%d}\n' \
-        "$$" "$_sessionctl_kind" "$screen" "$uuid" "$cwd" "$conda" "${EPOCHSECONDS:-0}" \
+    printf '{"pid":%d,"kind":"%s","screen":"%s","warp_uuid":"%s","cwd":"%s","conda":"%s","ts":%d,"resume_pending":"%s"}\n' \
+        "$$" "$_sessionctl_kind" "$screen" "$uuid" "$cwd" "$conda" "${EPOCHSECONDS:-0}" "$pending" \
         > "$_sessionctl_file" 2>/dev/null
 
     _sessionctl_last=$key
@@ -77,7 +85,21 @@ trap _sessionctl_cleanup EXIT
 # while still working in gnome-terminal. Verified by replaying Warp's own
 # bootstrap logic around this file: it reports the hook as captured, and a Warp
 # pane writes its state file.
-PROMPT_COMMAND="_sessionctl_save${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+_sessionctl_reconnect() {
+    [[ -n $_sessionctl_resume ]] || return 0
+    local command=$_sessionctl_resume
+    # Consume first, so Ctrl-C during the wait/connection cannot trigger a retry.
+    _sessionctl_resume=
+    local -a argv
+    # Restore emits only canonical space-separated tokens. No eval or shell expansion.
+    read -r -a argv <<< "$command"
+    [[ $_sessionctl_resume_delay == 0 ]] || sleep "$_sessionctl_resume_delay"
+    history -s "$command"
+    "${argv[@]}"
+    _sessionctl_save
+    return 0
+}
+PROMPT_COMMAND="_sessionctl_save; _sessionctl_reconnect${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 
 # Restore path: `sessionctl restore` launches tabs as
 #   bash -c 'SESSIONCTL_CONDA=<env> exec bash -i'

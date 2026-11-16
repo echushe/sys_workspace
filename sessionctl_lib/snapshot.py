@@ -243,7 +243,7 @@ def digest(snap):
     """
     relevant = {
         "terminals": [
-            [[t.get("cwd"), t.get("conda")] for t in w.get("tabs", [])]
+            [[t.get("cwd"), t.get("conda"), t.get("resume")] for t in w.get("tabs", [])]
             for w in snap.get("terminals", {}).get("windows", [])
         ],
         "mounts": sorted(
